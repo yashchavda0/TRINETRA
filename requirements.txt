@@ -1,0 +1,43 @@
+# Gujarat Police CCTV Integration System (TRINETRA) - Python tier
+# Verified stable release floors. Upper bounds pin the current major line so an
+# unattended reinstall cannot pull a breaking major.
+
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.29.0,<1.0.0
+asyncpg>=0.29.0,<1.0.0
+pydantic>=2.6.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
+
+# Protobuf runtime plus the compiler used to generate the Python bindings for
+# proto/surveillance_event.proto. Generate before running the worker:
+#   python -m grpc_tools.protoc -I proto --python_out=generated proto/surveillance_event.proto
+# (scripts/gen_proto.ps1 wraps this.) The generated module is not committed.
+# These two floors/ceilings are coupled: grpcio-tools 1.70+ requires
+# protobuf>=7.35, which pip cannot satisfy alongside a protobuf<6 pin. Keeping
+# grpcio-tools in the 1.62-1.69 line matches the protobuf 5.x runtime.
+protobuf>=5.26.1,<6.0.0
+grpcio-tools>=1.62.0,<1.70.0
+
+# workers/handoff_worker.py consumes the surveillance-events-raw topic that
+# cmd/ingestion_gateway produces to. Ships prebuilt wheels on Windows, so no C
+# toolchain is needed here (unlike the Go client's cgo librdkafka).
+confluent-kafka>=2.4.0,<3.0.0
+
+# adapters/external_db_bridge.py: async HTTP to eGujCop/VAHAN and the P0 alert
+# WebSocket fan-out.
+httpx[http2]>=0.27.0,<1.0.0
+
+# websockets 14 is the FLOOR, not a preference: AlertDispatcher._pump passes
+# additional_headers=, a keyword that only exists on the new asyncio client
+# introduced in 14.0. On 13.x every P0 dispatch raises TypeError inside the pump
+# and is swallowed by its broad except Exception, so alerts vanish silently.
+websockets>=14.0,<16.0
+
+# Model 4 predictive handoff engine (engine/). No GPU is required - both
+# resolve_device() and PredictiveHandoffManager fall back to CPU. For a CPU-only
+# box install torch first from the CPU index, which is far smaller than the
+# default CUDA wheels:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torch-geometric additionally wants torch already present at install time.
+torch>=2.2.0,<3.0.0
+torch-geometric>=2.5.0,<3.0.0

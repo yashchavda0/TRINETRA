@@ -1,0 +1,680 @@
+"""Live-stream signalling proxy between the GIS console and the media plane.
+
+The console speaks plain WebRTC signalling: `POST /api/v2/webrtc/offer` with
+`{camera_id, sdp, type}`, expecting `{type, sdp}` back. This module translates
+that into whichever media backend is configured:
+
+* **MediaMTX (default).** Forwards the offer to MediaMTX's WHEP endpoint and
+  returns its answer. MediaMTX owns ICE, DTLS and SRTP, so this is the path that
+  actually delivers pictures.
+* **cmd/stream_relay (legacy).** The original Go service. Kept working for
+  deployments that require it, with the caveat that its media path is not
+  functional - see the README's known limitations.
+
+Two things this module owns regardless of backend:
+
+1. **`rtsp_url` resolution.** The stream URL is looked up from the registry by
+   `camera_id`, never accepted from the caller. A console user can therefore only
+   open a stream for a registered camera, and the credential-bearing RTSP URL
+   never reaches the browser.
+2. **Session bookkeeping.** Every negotiated session is recorded in
+   `relay_sessions` so it survives a restart and can be reaped.
+
+A note on ICE, because it constrains everything here: the console posts its offer
+*before* ICE gathering completes and never sends a candidate afterwards
+(`GISMap.jsx:507-517` has no `onicecandidate` handler). The answer must therefore
+carry candidates the browser can reach on its own. That is why `mediamtx.yml`
+advertises 127.0.0.1 rather than the container's address.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from typing import Annotated, Final
+from urllib.parse import urlparse
+
+import asyncpg
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from app.config import Settings, get_settings
+from app.database import get_connection, get_pool
+from app.schemas import WebRTCAnswerResponse, WebRTCOfferRequest
+
+logger: Final = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v2", tags=["streams"])
+
+# Module-level clients so TLS handshakes and connection setup are amortised
+# across requests rather than repeated per offer.
+_relay_client: httpx.AsyncClient | None = None
+_media_client: httpx.AsyncClient | None = None
+_client_lock: Final = asyncio.Lock()
+_keepalive_task: asyncio.Task[None] | None = None
+
+
+# ---------------------------------------------------------------------------
+# HTTP clients
+# ---------------------------------------------------------------------------
+
+
+async def _get_media_client(settings: Settings) -> httpx.AsyncClient:
+    """Pooled plain-HTTP client for MediaMTX (loopback, no TLS)."""
+    global _media_client
+
+    if _media_client is None:
+        async with _client_lock:
+            if _media_client is None:
+                _media_client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(settings.mediamtx_request_timeout_seconds),
+                    follow_redirects=True,
+                )
+    return _media_client
+
+
+async def _get_relay_client(settings: Settings) -> httpx.AsyncClient:
+    """Pooled mTLS client for the legacy Go relay."""
+    global _relay_client
+
+    if _relay_client is None:
+        async with _client_lock:
+            if _relay_client is None:
+                if not settings.stream_relay_base_url:
+                    raise RuntimeError("stream_relay_base_url is not configured")
+                _relay_client = httpx.AsyncClient(
+                    base_url=settings.stream_relay_base_url.rstrip("/"),
+                    cert=settings.relay_client_cert,
+                    verify=settings.relay_ca_file or True,
+                    timeout=httpx.Timeout(settings.relay_request_timeout_seconds),
+                    headers={"Accept": "application/json"},
+                )
+    return _relay_client
+
+
+async def aclose_clients() -> None:
+    """Close both backend clients during application shutdown."""
+    global _media_client, _relay_client
+
+    for name in ("_media_client", "_relay_client"):
+        client = globals()[name]
+        if client is not None:
+            globals()[name] = None
+            await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# MediaMTX path resolution
+# ---------------------------------------------------------------------------
+
+
+def _path_from_stream_url(stream_url: str) -> str | None:
+    """Return the MediaMTX path when `stream_url` already points at MediaMTX."""
+    parsed = urlparse(stream_url)
+    path = parsed.path.lstrip("/")
+    return path or None
+
+
+def _is_mediamtx_source(stream_url: str, settings: Settings) -> bool:
+    """True when the camera publishes directly to our MediaMTX instance."""
+    parsed = urlparse(stream_url)
+    if parsed.scheme.lower() not in {"rtsp", "rtsps"}:
+        return False
+
+    host = (parsed.hostname or "").lower()
+    port = parsed.port or 554
+    configured_host, _, configured_port = settings.mediamtx_rtsp_host.partition(":")
+    configured_host = configured_host.lower()
+
+    # Treat the loopback spellings as the same host: a camera row may say
+    # localhost while the setting says 127.0.0.1.
+    loopback = {"127.0.0.1", "localhost", "::1", "mediamtx"}
+    host_matches = host == configured_host or (
+        host in loopback and configured_host in loopback
+    )
+    return host_matches and str(port) == (configured_port or "8554")
+
+
+def _rtsp_endpoint(stream_url: str) -> str:
+    """`rtsp://host:port` with credentials and path stripped, for error text.
+
+    Never echo the full stream_url to a client: it carries camera credentials.
+    """
+    parsed = urlparse(stream_url)
+    host = parsed.hostname or "?"
+    port = parsed.port or 554
+    return f"{parsed.scheme or 'rtsp'}://{host}:{port}"
+
+
+def _media_unreachable(settings: Settings, exc: Exception) -> HTTPException:
+    """502 for a media server that is genuinely not answering."""
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=(
+            "media server is unreachable at "
+            f"{settings.mediamtx_whep_base_url} - is the mediamtx container running?"
+        ),
+    )
+
+
+async def _describe_path(path_name: str, settings: Settings) -> str:
+    """MediaMTX's own view of a path, for inclusion in a timeout message.
+
+    Asking the server what it observed beats reporting what our HTTP client
+    inferred: it distinguishes "never connected to the camera" from "connected
+    but produced no media".
+    """
+    client = await _get_media_client(settings)
+    api_base = (settings.mediamtx_api_base_url or "").rstrip("/")
+    try:
+        response = await client.get(
+            f"{api_base}/v3/paths/get/{path_name}",
+            timeout=httpx.Timeout(settings.mediamtx_request_timeout_seconds),
+        )
+        if response.status_code != status.HTTP_200_OK:
+            return "media server has no record of the path"
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return "media server did not report the path state"
+
+    ready = bool(body.get("ready"))
+    if ready:
+        return "the path is ready but produced no media in time"
+    return "the camera source never became ready"
+
+
+async def _ensure_pull_path(
+    camera_id: uuid.UUID, stream_url: str, settings: Settings
+) -> str:
+    """Create or refresh an on-demand MediaMTX path pulling from a camera.
+
+    Used for real cameras, whose RTSP endpoint lives on the camera itself rather
+    than on our media server. `sourceOnDemand` means MediaMTX only opens the
+    camera's stream while a viewer is watching, which matters at fleet scale.
+    """
+    path_name = f"cam-{camera_id}"
+    client = await _get_media_client(settings)
+    api_base = (settings.mediamtx_api_base_url or "").rstrip("/")
+    config = {
+        "source": stream_url,
+        "sourceOnDemand": True,
+        "sourceProtocol": "tcp",
+    }
+    control_timeout = httpx.Timeout(settings.mediamtx_request_timeout_seconds)
+
+    try:
+        response = await client.post(
+            f"{api_base}/v3/config/paths/add/{path_name}",
+            json=config,
+            timeout=control_timeout,
+        )
+
+        # "path already exists" is the normal second-viewer case, but the stored
+        # source may be stale - a corrected stream_url would otherwise never take
+        # effect, and the camera would stream from its old address forever.
+        if response.status_code >= 400 and "already exists" in response.text.lower():
+            logger.debug(
+                "media path exists; refreshing its source",
+                extra={"camera_id": str(camera_id), "path": path_name},
+            )
+            # This endpoint is registered under the HTTP PATCH verb only -
+            # POSTing to it returns "404 page not found" from the router, which
+            # looks like a missing path rather than a wrong method. Verified
+            # against MediaMTX v1.9.3.
+            response = await client.patch(
+                f"{api_base}/v3/config/paths/patch/{path_name}",
+                json=config,
+                timeout=control_timeout,
+            )
+    except httpx.HTTPError as exc:
+        # The control API is on loopback and answers in milliseconds, so ANY
+        # transport failure here means the media server is not there. Matching
+        # on ConnectError alone is not enough: a stopped container behind
+        # Docker's port proxy resets the connection instead of refusing it,
+        # which surfaces as ReadError or RemoteProtocolError.
+        logger.error(
+            "mediamtx control API unreachable",
+            extra={
+                "camera_id": str(camera_id),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise _media_unreachable(settings, exc) from exc
+
+    if response.status_code >= 400:
+        logger.error(
+            "mediamtx rejected path configuration",
+            extra={
+                "camera_id": str(camera_id),
+                "status_code": response.status_code,
+                "body": response.text[:200],
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"media server refused the camera path ({response.status_code})",
+        )
+
+    return path_name
+
+
+# ---------------------------------------------------------------------------
+# Offer handling
+# ---------------------------------------------------------------------------
+
+
+async def _negotiate_via_mediamtx(
+    payload: WebRTCOfferRequest, stream_url: str, settings: Settings
+) -> tuple[str, str, str]:
+    """Run the WHEP exchange. Returns (answer_sdp, session_id, resource_url)."""
+    is_published = _is_mediamtx_source(stream_url, settings)
+    if is_published:
+        path_name = _path_from_stream_url(stream_url)
+        if not path_name:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="camera stream_url names no MediaMTX path",
+            )
+    else:
+        path_name = await _ensure_pull_path(payload.camera_id, stream_url, settings)
+
+    client = await _get_media_client(settings)
+    whep_base = (settings.mediamtx_whep_base_url or "").rstrip("/")
+    whep_url = f"{whep_base}/{path_name}/whep"
+
+    try:
+        # WHEP is SDP-over-HTTP: the offer is the raw body, not JSON. A pull path
+        # gets the longer budget because MediaMTX has to bring the camera up
+        # before it can answer.
+        response = await client.post(
+            whep_url,
+            content=payload.sdp.encode("utf-8"),
+            headers={"Content-Type": "application/sdp", "Accept": "application/sdp"},
+            timeout=httpx.Timeout(
+                settings.mediamtx_request_timeout_seconds
+                if is_published
+                else settings.mediamtx_source_start_timeout_seconds
+            ),
+        )
+    except httpx.TimeoutException as exc:
+        # MediaMTX accepted the request but could not produce media in time,
+        # which in practice means the camera's own RTSP endpoint is unreachable.
+        budget = (
+            settings.mediamtx_request_timeout_seconds
+            if is_published
+            else settings.mediamtx_source_start_timeout_seconds
+        )
+        observed = await _describe_path(path_name, settings)
+        endpoint = _rtsp_endpoint(stream_url)
+        logger.warning(
+            "camera source did not start streaming",
+            extra={
+                "camera_id": str(payload.camera_id),
+                "path": path_name,
+                "rtsp_endpoint": endpoint,
+                "timeout_seconds": budget,
+                "observed": observed,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=(
+                f"camera source {endpoint} did not start streaming within "
+                f"{budget:g}s: {observed}. The media server is up - check that "
+                "the camera is reachable and its stream_url is correct."
+            ),
+        ) from exc
+    except httpx.HTTPError as exc:
+        # Not a timeout, so not the camera being slow: the signalling transport
+        # itself failed, which means the media server is gone.
+        logger.error(
+            "whep exchange failed",
+            extra={
+                "camera_id": str(payload.camera_id),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise _media_unreachable(settings, exc) from exc
+
+    if response.status_code not in (status.HTTP_200_OK, status.HTTP_201_CREATED):
+        body = response.text[:300]
+        lowered = body.lower()
+        logger.warning(
+            "mediamtx refused the session",
+            extra={
+                "camera_id": str(payload.camera_id),
+                "path": path_name,
+                "status_code": response.status_code,
+                "body": body,
+            },
+        )
+
+        # MediaMTX does not hold the request open when a pull source fails to
+        # come up: it answers 400 with "source of path '...' has timed out".
+        # That is the camera's fault, not the media server's, so it must not be
+        # reported as a 502 - which is what sent the last investigation to the
+        # wrong component.
+        if "timed out" in lowered or "not ready" in lowered:
+            endpoint = _rtsp_endpoint(stream_url)
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail=(
+                    f"camera source {endpoint} did not start streaming: the media "
+                    "server is up but the camera did not respond. Check that the "
+                    "camera is reachable and its stream_url is correct."
+                ),
+            )
+
+        if response.status_code == status.HTTP_404_NOT_FOUND or "publish" in lowered:
+            # The path exists in config but nothing is publishing to it.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"no live stream on media path '{path_name}'. Nothing is "
+                    "publishing to it - check that the source is up."
+                ),
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"media server refused the session (status {response.status_code})",
+        )
+
+    answer_sdp = response.text
+    if "v=0" not in answer_sdp:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="media server returned something that is not an SDP answer",
+        )
+
+    # WHEP names the session resource in Location; it is what a DELETE targets.
+    # Location is usually relative, so resolve it against the WHEP endpoint.
+    location = response.headers.get("Location", "")
+    resource_url = str(httpx.URL(whep_url).join(location)) if location else whep_url
+
+    return answer_sdp, uuid.uuid4().hex, resource_url
+
+
+async def _negotiate_via_relay(
+    payload: WebRTCOfferRequest, stream_url: str, settings: Settings
+) -> tuple[str, str, str]:
+    """Legacy path: broker the offer through cmd/stream_relay over mTLS."""
+    client = await _get_relay_client(settings)
+    try:
+        response = await client.post(
+            "/api/v1/streams/play",
+            json={
+                "camera_id": str(payload.camera_id),
+                "rtsp_url": stream_url,
+                "sdp_offer": payload.sdp,
+            },
+        )
+    except httpx.HTTPError as exc:
+        logger.error(
+            "relay unreachable",
+            extra={"camera_id": str(payload.camera_id), "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="stream relay is unreachable",
+        ) from exc
+
+    if response.status_code != status.HTTP_200_OK:
+        # The relay's body can name the camera's RTSP failure, but it also
+        # contains the credential-bearing stream URL, so never echo it verbatim.
+        logger.warning(
+            "relay refused session",
+            extra={
+                "camera_id": str(payload.camera_id),
+                "relay_status": response.status_code,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"stream relay refused the session (relay status {response.status_code})",
+        )
+
+    body = response.json()
+    session_id = str(body.get("session_id") or "")
+    sdp_answer = str(body.get("sdp_answer") or "")
+    if not session_id or not sdp_answer:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="stream relay returned an incomplete session",
+        )
+
+    return sdp_answer, session_id, str(settings.stream_relay_base_url)
+
+
+@router.post(
+    "/webrtc/offer",
+    response_model=WebRTCAnswerResponse,
+    summary="Open a live stream for a registered camera",
+)
+async def webrtc_offer(
+    payload: WebRTCOfferRequest,
+    connection: Annotated[asyncpg.Connection, Depends(get_connection)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> WebRTCAnswerResponse:
+    """Resolve the camera's stream URL, then negotiate with the media backend."""
+    backend = settings.media_backend
+    if backend == "none":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "live streaming is unavailable: neither MEDIAMTX_WHEP_BASE_URL nor "
+                "STREAM_RELAY_BASE_URL is configured, so no media backend is deployed"
+            ),
+        )
+
+    record = await connection.fetchrow(
+        "SELECT stream_url, status FROM cameras WHERE id = $1", payload.camera_id
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"camera '{payload.camera_id}' is not registered",
+        )
+    if record["status"] != "ACTIVE":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"camera '{payload.camera_id}' is {record['status']}, not ACTIVE",
+        )
+
+    stream_url = record["stream_url"]
+    if backend == "mediamtx":
+        sdp_answer, session_id, resource = await _negotiate_via_mediamtx(
+            payload, stream_url, settings
+        )
+    else:
+        sdp_answer, session_id, resource = await _negotiate_via_relay(
+            payload, stream_url, settings
+        )
+
+    await connection.execute(
+        """
+        INSERT INTO relay_sessions (session_id, camera_id, relay_addr, state)
+        VALUES ($1, $2, $3, 'ACTIVE')
+        ON CONFLICT (session_id) DO UPDATE
+        SET state = 'ACTIVE',
+            relay_addr = EXCLUDED.relay_addr,
+            last_heartbeat_at = clock_timestamp()
+        """,
+        session_id,
+        payload.camera_id,
+        resource,
+    )
+
+    logger.info(
+        "live session opened",
+        extra={
+            "camera_id": str(payload.camera_id),
+            "session_id": session_id,
+            "backend": backend,
+        },
+    )
+    return WebRTCAnswerResponse(
+        sdp=sdp_answer, session_id=session_id, camera_id=payload.camera_id
+    )
+
+
+# ---------------------------------------------------------------------------
+# Session maintenance
+# ---------------------------------------------------------------------------
+
+
+async def _maintain_mediamtx_sessions(settings: Settings) -> None:
+    """Retire aged sessions and free their WHEP resources.
+
+    WHEP has no heartbeat: a session lives until it is DELETEd or its ICE
+    connection drops. MediaMTX already frees sessions when the browser goes
+    away, so this is cleanup for rows whose browser vanished without a clean
+    teardown - and it stops `relay_sessions` growing without bound.
+    """
+    pool = get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            """
+            UPDATE relay_sessions
+            SET state = 'CLOSED', closed_at = clock_timestamp()
+            WHERE state = 'ACTIVE'
+              AND started_at < clock_timestamp() - ($1 * INTERVAL '1 second')
+            RETURNING session_id, relay_addr
+            """,
+            settings.relay_session_max_age_seconds,
+        )
+
+    if not rows:
+        return
+
+    client = await _get_media_client(settings)
+    for row in rows:
+        resource = row["relay_addr"]
+        if not resource or "/whep" not in resource:
+            continue
+        try:
+            await client.delete(resource)
+        except httpx.HTTPError as exc:
+            # Best-effort: MediaMTX has very likely already reclaimed it.
+            logger.debug(
+                "whep resource delete failed",
+                extra={"session_id": row["session_id"], "error": str(exc)},
+            )
+
+
+async def _heartbeat_relay_sessions(settings: Settings) -> None:
+    """Heartbeat every ACTIVE legacy relay session and retire the dead ones.
+
+    Only the Go relay needs this: it reaps a session after 30s of silence and
+    the console never calls its heartbeat route.
+    """
+    pool = get_pool()
+
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            UPDATE relay_sessions
+            SET state = 'CLOSED', closed_at = clock_timestamp()
+            WHERE state = 'ACTIVE'
+              AND started_at < clock_timestamp() - ($1 * INTERVAL '1 second')
+            """,
+            settings.relay_session_max_age_seconds,
+        )
+        rows = await connection.fetch(
+            "SELECT session_id FROM relay_sessions WHERE state = 'ACTIVE'"
+        )
+
+    if not rows:
+        return
+
+    client = await _get_relay_client(settings)
+    for row in rows:
+        session_id = row["session_id"]
+        try:
+            response = await client.post(f"/api/v1/streams/heartbeat/{session_id}")
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "session heartbeat failed",
+                extra={"session_id": session_id, "error": str(exc)},
+            )
+            continue
+
+        async with pool.acquire() as connection:
+            if response.status_code == status.HTTP_200_OK:
+                await connection.execute(
+                    """
+                    UPDATE relay_sessions
+                    SET last_heartbeat_at = clock_timestamp()
+                    WHERE session_id = $1
+                    """,
+                    session_id,
+                )
+            elif response.status_code == status.HTTP_404_NOT_FOUND:
+                # The relay already reaped or restarted; stop paying for this row.
+                await connection.execute(
+                    """
+                    UPDATE relay_sessions
+                    SET state = 'CLOSED', closed_at = clock_timestamp()
+                    WHERE session_id = $1
+                    """,
+                    session_id,
+                )
+                logger.info(
+                    "session no longer known to relay", extra={"session_id": session_id}
+                )
+
+
+async def _keepalive_loop(settings: Settings) -> None:
+    backend = settings.media_backend
+    while True:
+        try:
+            if backend == "mediamtx":
+                await _maintain_mediamtx_sessions(settings)
+            elif backend == "relay":
+                await _heartbeat_relay_sessions(settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("session maintenance iteration failed")
+        await asyncio.sleep(settings.relay_session_keepalive_seconds)
+
+
+def start_keepalive(settings: Settings) -> None:
+    """Start session maintenance, unless no media backend is configured."""
+    global _keepalive_task
+
+    backend = settings.media_backend
+    if backend == "none":
+        logger.info("session maintenance not started: no media backend configured")
+        return
+    if _keepalive_task is not None and not _keepalive_task.done():
+        return
+
+    _keepalive_task = asyncio.create_task(
+        _keepalive_loop(settings), name="stream-session-maintenance"
+    )
+    logger.info(
+        "session maintenance started",
+        extra={
+            "backend": backend,
+            "interval_seconds": settings.relay_session_keepalive_seconds,
+        },
+    )
+
+
+async def stop_keepalive() -> None:
+    """Cancel maintenance and release both backend clients."""
+    global _keepalive_task
+
+    if _keepalive_task is not None:
+        task, _keepalive_task = _keepalive_task, None
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await aclose_clients()

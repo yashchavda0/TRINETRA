@@ -1,0 +1,46 @@
+# Secrets and local configuration
+.env
+.env.local
+.env.*.local
+
+# Database credentials for the compose stack. Create it from
+# docker/postgres.env.example. Listed by exact path, not docker/*.env, because
+# docker/kafka.env and docker/mediamtx.env hold no secrets and are tracked.
+docker/postgres.env
+
+# Development PKI. Contains unencrypted private keys, including the CA's.
+certs/
+
+# Protobuf codegen output: a build artifact of proto/surveillance_event.proto.
+# Regenerate with scripts/gen_proto.ps1 rather than committing a stale copy.
+generated/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Go
+# NOTE: go.sum is deliberately NOT ignored. It must be committed once
+# `go mod tidy` generates it, or every build resolves a different dependency
+# graph and the module verification it provides is worthless.
+/bin/
+*.exe
+*.test
+
+# Editors and OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

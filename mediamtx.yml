@@ -1,0 +1,90 @@
+# MediaMTX configuration for the TRINETRA development stack.
+#
+# Role: this is the media plane. It ingests RTSP (from real cameras, or from the
+# looping test-video publishers started by scripts/publish_videos.ps1) and serves
+# it to browsers over WebRTC. The FastAPI service at /api/v2/webrtc/offer proxies
+# the SDP exchange here; the console never talks to this server directly.
+#
+# DEVELOPMENT POSTURE: every listener below is published on 127.0.0.1 only (see
+# docker-compose.infra.yml) and authentication is left at its permissive default.
+# A deployment reachable from anything but this machine must add
+# authInternalUsers with real credentials before it carries operational video.
+
+logLevel: info
+logDestinations: [stdout]
+
+###############################################################################
+# API - used by the FastAPI proxy to create on-demand pull paths for cameras
+# whose RTSP source lives outside this server.
+###############################################################################
+api: yes
+apiAddress: :9997
+
+###############################################################################
+# Authentication
+###############################################################################
+# The built-in default user grants publish/read/playback but NOT api, so the
+# control API answers 401 without this block. Everything below is the default
+# set plus api and metrics, for an anonymous user.
+#
+# DEVELOPMENT POSTURE, and the reason it is acceptable here: every listener is
+# published on 127.0.0.1 only. Anything reachable beyond this machine must
+# replace this with named users and real passwords - as written, any client that
+# can reach port 9997 can reconfigure the media server.
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+      - action: metrics
+
+###############################################################################
+# RTSP ingest
+###############################################################################
+rtsp: yes
+rtspAddress: :8554
+
+###############################################################################
+# WebRTC delivery
+###############################################################################
+webrtc: yes
+webrtcAddress: :8889
+
+# THE CRITICAL PAIR. The browser (frontend/src/components/GISMap.jsx) posts its
+# SDP offer before ICE gathering finishes and never trickles a candidate, so
+# whatever address is advertised here is the only address it will ever try.
+#
+# webrtcIPsFromInterfaces would advertise this container's private IP
+# (172.x.x.x), which no browser on the host can route to - the connection would
+# fail silently and the video pane would stay black with no error anywhere.
+# Advertising 127.0.0.1 works because docker-compose publishes the UDP media
+# port on loopback.
+#
+# Serving a browser on another machine means replacing 127.0.0.1 with this
+# host's LAN address or hostname.
+webrtcIPsFromInterfaces: no
+webrtcAdditionalHosts: [127.0.0.1]
+
+# Must match the published UDP port in docker-compose.infra.yml. All WebRTC
+# media for every session is muxed onto this one port.
+webrtcLocalUDPAddress: :8189
+
+###############################################################################
+# Disable the protocols this stack does not use, so nothing extra is listening.
+###############################################################################
+rtmp: no
+hls: no
+srt: no
+
+###############################################################################
+# Paths
+###############################################################################
+# Accept any path name without prior configuration: one test video published as
+# rtsp://.../ahmedabad-junction needs no entry here, and the API creates pull
+# paths for real cameras dynamically through /v3/config/paths/add.
+paths:
+  all_others:

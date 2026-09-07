@@ -1,0 +1,96 @@
+# Local infrastructure for the TRINETRA stack: PostgreSQL/PostGIS and Kafka.
+#
+# The application tier (FastAPI, the Model 4 worker, the Vite console) runs
+# natively on the host, so both services publish their ports to localhost and
+# Kafka advertises "localhost:9092". A containerised app on this network would
+# not be able to reach that advertised address - if you later containerise the
+# Python tier, add a second advertised listener on the compose network.
+#
+# No configuration values are written inline below: every service takes its
+# environment from a file under docker/. docker/postgres.env carries the database
+# credentials and is gitignored, so it must be created from its template before
+# the first start or Compose aborts with "env file ... not found".
+#
+# Usage:
+#   Copy-Item docker/postgres.env.example docker/postgres.env   # first time only
+#   docker compose -f docker-compose.infra.yml up -d
+#   docker compose -f docker-compose.infra.yml ps
+#   docker compose -f docker-compose.infra.yml down          # keeps volumes
+#   docker compose -f docker-compose.infra.yml down -v       # wipes data
+
+name: trinetra-infra
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: trinetra-postgres
+    restart: unless-stopped
+    # Credentials and timezone live in docker/postgres.env (gitignored). Create
+    # it from docker/postgres.env.example; keep DATABASE_URL in .env in sync.
+    env_file:
+      - docker/postgres.env
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Migrations are applied explicitly by scripts/migrate.ps1 rather than
+      # through /docker-entrypoint-initdb.d, so re-running them is a normal
+      # operation instead of something that only happens on a fresh volume.
+      - ./sql:/sql:ro
+    healthcheck:
+      # $$ escapes Compose's own interpolation so the expansion happens in the
+      # container's shell, against the variables env_file supplied. A single $
+      # would be resolved at parse time against the host, which has neither.
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: trinetra-kafka
+    restart: unless-stopped
+    # Single-node KRaft topology lives in docker/kafka.env, including why the
+    # advertised listener must be 127.0.0.1 rather than localhost.
+    env_file:
+      - docker/kafka.env
+    ports:
+      - "127.0.0.1:9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    container_name: trinetra-mediamtx
+    restart: unless-stopped
+    # Media plane: RTSP in, WebRTC out. The API proxies SDP offers here; see
+    # mediamtx.yml for why it must advertise 127.0.0.1 as its ICE host.
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    ports:
+      - "127.0.0.1:8554:8554"     # RTSP ingest (publishers push here)
+      - "127.0.0.1:8889:8889"     # WebRTC/WHEP signalling
+      - "127.0.0.1:8189:8189/udp" # WebRTC media - UDP. Without this, video never arrives.
+      - "127.0.0.1:9997:9997"     # control API
+    env_file:
+      - docker/mediamtx.env
+    # No healthcheck: the image is built FROM scratch and contains only the
+    # mediamtx binary - no shell, no wget, no curl - so any CMD/CMD-SHELL probe
+    # fails with "executable file not found" and marks a working container
+    # unhealthy. Check it from the host instead:
+    #   Invoke-RestMethod http://127.0.0.1:9997/v3/paths/list
+
+volumes:
+  postgres-data:
+  kafka-data:

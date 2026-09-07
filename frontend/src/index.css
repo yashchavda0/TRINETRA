@@ -1,0 +1,22 @@
+/* The map component sizes itself to 100% height, so every ancestor up to <html>
+   must have a real height or the console collapses to its 480px minimum. */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #0b0f14;
+  color: #e6edf3;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}

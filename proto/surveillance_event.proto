@@ -1,0 +1,158 @@
+// Gujarat Police CCTV Integration System
+// Analytics bus wire contract for detection / recognition events.
+//
+// GLOBAL INVARIANTS (apply to every producer and consumer of this contract):
+//   * Spatial reference system is WGS84 / EPSG:4326 exclusively. Degrees, never metres,
+//     never a projected CRS, never Web Mercator.
+//   * All timestamps are UTC Unix epoch MILLISECONDS as int64. No local time, no
+//     seconds-precision epochs, no formatted date strings.
+//   * Wire compatibility: field tags are permanent. Never renumber, never reuse a
+//     retired tag. Add new fields with new tags and move retired tags to `reserved`.
+
+syntax = "proto3";
+
+package gujpolice.surveillance.v1;
+
+option go_package = "github.com/gujpolice/cctv/gen/surveillance/v1;surveillancev1";
+option java_package = "in.gov.gujarat.police.surveillance.v1";
+option java_multiple_files = true;
+option java_outer_classname = "SurveillanceEventProto";
+option csharp_namespace = "GujPolice.Surveillance.V1";
+
+// ---------------------------------------------------------------------------
+// Enumerations
+// ---------------------------------------------------------------------------
+
+// Owning department of the camera that produced the event.
+//
+// The named members are kept numerically stable and MUST match the primary keys
+// seeded into the Model 1 registry table `departments` (see
+// sql/001_init_model1_registry.sql). The UNSPECIFIED member at tag 0 exists only
+// because proto3 mandates a zero-valued default; it signals "producer did not set
+// the field" and must be treated as a data-quality fault, not as a department.
+enum DepartmentCode {
+  DEPARTMENT_CODE_UNSPECIFIED = 0;
+  POLICE = 1;
+  RTO = 2;
+  GSRTC = 3;
+  CIVIL_SUPPLIES = 4;
+  REVENUE = 5;
+  PRIVATE = 6;
+}
+
+// Coarse class assigned to the detected object by the edge analytics engine.
+//
+// UNSPECIFIED (tag 0) means the producer never populated the field. UNKNOWN (tag 6)
+// is a positive assertion: the detector saw an object and could not classify it.
+// These two are deliberately distinct and must not be collapsed by consumers.
+enum ObjectClass {
+  OBJECT_CLASS_UNSPECIFIED = 0;
+  PEDESTRIAN = 1;
+  AUTOMOBILE = 2;
+  MOTORCYCLE = 3;
+  TRUCK = 4;
+  BUS = 5;
+  UNKNOWN = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Value messages
+// ---------------------------------------------------------------------------
+
+// Geographic position and orientation of the observing camera.
+//
+// latitude / longitude are WGS84 (EPSG:4326) decimal degrees, double precision.
+// Valid ranges: latitude [-90.0, 90.0], longitude [-180.0, 180.0].
+//
+// NOTE ON AXIS ORDER: this message carries latitude first because that is the
+// human/GIS convention. PostGIS `ST_MakePoint` takes LONGITUDE FIRST. Any code
+// bridging this message into SQL must swap: ST_MakePoint(longitude, latitude).
+message GeoLocation {
+  double latitude = 1;
+  double longitude = 2;
+
+  // Compass bearing the camera faces: 0.0 = true north, increasing clockwise.
+  // Valid range [0.0, 360.0]. Mirrors `cameras.azimuth_angle` in the registry.
+  float azimuth_degrees = 3;
+}
+
+// Axis-aligned bounding box of the detected object within the source video frame.
+//
+// Coordinates are NORMALISED to the frame: 0.0 = left/top edge, 1.0 = right/bottom
+// edge. Normalised rather than pixel coordinates so a box stays valid across the
+// mixed sensor resolutions in the 80,000+ camera fleet.
+//
+// Origin is top-left, y increasing downward (standard image convention).
+// Invariants: x_min < x_max, y_min < y_max, all values within [0.0, 1.0].
+message BBox {
+  float x_min = 1;
+  float y_min = 2;
+  float x_max = 3;
+  float y_max = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Root event
+// ---------------------------------------------------------------------------
+
+// A single object detection emitted by one camera at one instant.
+//
+// This is the atomic unit on the analytics bus. One frame containing three
+// detected objects produces three SurveillanceEvent messages sharing a
+// camera_id and timestamp_utc_ms but carrying distinct event_ids.
+message SurveillanceEvent {
+  // Canonical hyphenated lowercase UUIDv4 string, e.g.
+  // "3f2504e0-4f89-41d3-9a0c-0305e82c3301". Globally unique per detection;
+  // consumers use it as the idempotency key for at-least-once bus delivery.
+  string event_id = 1;
+
+  // UUID of the producing camera. Foreign key into the Model 1 Central GIS
+  // Camera Registry: `cameras.id`. Same canonical hyphenated UUID text form.
+  string camera_id = 2;
+
+  // Owning department of `camera_id`. Denormalised onto the event so downstream
+  // consumers can route and apply access control without a registry round trip.
+  DepartmentCode department_code = 3;
+
+  // Capture instant of the source video frame — NOT the time the analytics engine
+  // finished inference, and NOT the time the message was published.
+  // UTC Unix epoch MILLISECONDS.
+  int64 timestamp_utc_ms = 4;
+
+  // Position and orientation of the observing camera at capture time.
+  // Snapshotted from the registry rather than looked up later, so a subsequent
+  // camera relocation cannot retroactively move historical evidence.
+  GeoLocation location = 5;
+
+  // Location of the object inside the frame, normalised. See BBox.
+  BBox bounding_box = 6;
+
+  ObjectClass object_class = 7;
+
+  // Open key/value bag for classifier outputs that vary by object class and by
+  // vendor. Both key and value are strings; numeric values are decimal text.
+  //
+  // Reserved keys (stable across the fleet — extend, never redefine):
+  //   "license_plate"     ANPR reading, uppercase, no spaces, e.g. "GJ01AB1234"
+  //   "license_plate_conf" ANPR confidence, "0.0".."1.0"
+  //   "color"             dominant object colour, lowercase, e.g. "white"
+  //   "make"              vehicle manufacturer, e.g. "maruti"
+  //   "model"             vehicle model, e.g. "swift"
+  //   "confidence"        detection confidence, "0.0".."1.0"
+  //   "track_id"          producer-local tracklet id, stable within one stream
+  map<string, string> attributes = 8;
+
+  // Re-identification feature vector. EXACTLY 512 float32 values — no other
+  // length is valid on this bus. Producers must reject a short or long vector at
+  // the edge; consumers must reject any message whose length != 512 rather than
+  // padding or truncating, because a mismatched vector silently corrupts cosine
+  // similarity scoring across the whole fleet.
+  //
+  // Vectors are expected L2-normalised so similarity is a plain dot product.
+  repeated float feature_embedding = 9;
+
+  // Tags held back for future contract growth (e.g. frame_uri, analytics engine
+  // version, cropped-thumbnail reference). Reserved so no producer can claim them
+  // ad hoc and collide with a later official field.
+  reserved 10 to 19;
+}
