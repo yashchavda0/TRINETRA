@@ -1,103 +1,193 @@
-import React, { useCallback, useState } from 'react';
-
-import GISMap from './components/GISMap.jsx';
-
-// Ahmedabad. Note the [lon, lat] order GISMap expects, matching OpenLayers.
-const DEFAULT_CENTER = [72.5714, 23.0225];
-
 /**
- * Console shell.
+ * Route table for the console.
  *
- * Every backend URL is relative so it rides the Vite dev proxy (see
- * vite.config.js) and, in production, whatever reverse proxy fronts the API.
- * In particular alertsWsUrl is a path rather than the component's hardcoded
- * ws://central-command default, which resolves nowhere from a browser.
+ * Screens are lazy-loaded so the map bundle - OpenLayers is the largest single
+ * dependency - is not downloaded to reach the login form.
  */
-export default function App() {
-  const [alertCount, setAlertCount] = useState(0);
-  const [lastAlert, setLastAlert] = useState(null);
 
-  const handleAlert = useCallback((alert) => {
-    setAlertCount((count) => count + 1);
-    setLastAlert(alert);
-  }, []);
+import React, { Suspense, lazy } from 'react';
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 
+import AppShell from './components/layout/AppShell.jsx';
+import LoginPage from './pages/LoginPage.jsx';
+import { Spinner } from './components/ui/index.jsx';
+import { useAuth } from './lib/auth.jsx';
+
+const DashboardPage = lazy(() => import('./pages/DashboardPage.jsx'));
+const RegistryPage = lazy(() => import('./pages/RegistryPage.jsx'));
+const CameraDetailPage = lazy(() => import('./pages/CameraDetailPage.jsx'));
+const MapPage = lazy(() => import('./pages/MapPage.jsx'));
+const GapAnalysisPage = lazy(() => import('./pages/GapAnalysisPage.jsx'));
+const HealthPage = lazy(() => import('./pages/HealthPage.jsx'));
+const VideoWallPage = lazy(() => import('./pages/VideoWallPage.jsx'));
+const VehicleSearchPage = lazy(() => import('./pages/VehicleSearchPage.jsx'));
+const AlertsPage = lazy(() => import('./pages/AlertsPage.jsx'));
+const FederationPage = lazy(() => import('./pages/FederationPage.jsx'));
+const PlaybackPage = lazy(() => import('./pages/PlaybackPage.jsx'));
+const UsersPage = lazy(() => import('./pages/UsersPage.jsx'));
+const AuditPage = lazy(() => import('./pages/AuditPage.jsx'));
+
+function FullPageSpinner() {
   return (
-    <div style={styles.shell}>
-      <header style={styles.header}>
-        <div style={styles.brand}>
-          <span style={styles.mark}>TRINETRA</span>
-          <span style={styles.subtitle}>Gujarat Police · Integrated CCTV Console</span>
-        </div>
-        <div style={styles.status}>
-          {lastAlert ? (
-            <span style={styles.alertBadge}>
-              {alertCount} alert{alertCount === 1 ? '' : 's'} · last{' '}
-              {lastAlert.classification || 'UNCLASSIFIED'}
-              {lastAlert.plate_number ? ` · ${lastAlert.plate_number}` : ''}
-            </span>
-          ) : (
-            <span style={styles.idleBadge}>no alerts this session</span>
-          )}
-        </div>
-      </header>
-
-      <main style={styles.map}>
-        <GISMap
-          apiBaseUrl="/api/v1"
-          webrtcBaseUrl="/api/v2"
-          alertsWsUrl="/alerts/p0"
-          center={DEFAULT_CENTER}
-          zoom={11}
-          onAlert={handleAlert}
-        />
-      </main>
+    <div className="flex h-full items-center justify-center py-24">
+      <Spinner className="h-6 w-6" />
     </div>
   );
 }
 
-const styles = {
-  shell: {
-    display: 'flex',
-    flexDirection: 'column',
-    height: '100%',
-    width: '100%',
-  },
-  header: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 16,
-    padding: '10px 16px',
-    borderBottom: '1px solid #1f2a37',
-    background: '#0f1620',
-    flex: '0 0 auto',
-  },
-  brand: { display: 'flex', alignItems: 'baseline', gap: 12, minWidth: 0 },
-  mark: { fontSize: 18, fontWeight: 700, letterSpacing: 1.5 },
-  subtitle: {
-    fontSize: 12,
-    color: '#8b98a5',
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-  },
-  status: { flex: '0 0 auto' },
-  alertBadge: {
-    fontSize: 12,
-    padding: '4px 10px',
-    borderRadius: 999,
-    background: '#3b0d0d',
-    border: '1px solid #7f1d1d',
-    color: '#fecaca',
-  },
-  idleBadge: {
-    fontSize: 12,
-    padding: '4px 10px',
-    borderRadius: 999,
-    background: '#111c26',
-    border: '1px solid #1f2a37',
-    color: '#8b98a5',
-  },
-  map: { flex: '1 1 auto', minHeight: 0, position: 'relative' },
-};
+function RequireAuth({ children }) {
+  const { isAuthenticated, status } = useAuth();
+  const location = useLocation();
+
+  if (status === 'loading') return <FullPageSpinner />;
+  if (!isAuthenticated) {
+    // `state.from` is what sends the user back where they were aiming once
+    // they have signed in.
+    return <Navigate to="/login" replace state={{ from: location }} />;
+  }
+  return children;
+}
+
+function RequireRole({ role, children }) {
+  const { atLeast } = useAuth();
+  if (!atLeast(role)) {
+    return (
+      <div className="p-6">
+        <div className="rounded-md border border-state-warn/40 bg-state-warn/10 p-4">
+          <p className="text-sm font-medium text-state-warn">Not available to your role</p>
+          <p className="mt-1 text-xs text-slate-300">
+            This screen requires the {role} role. Your account does not hold it.
+          </p>
+        </div>
+      </div>
+    );
+  }
+  return children;
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+
+      <Route
+        element={
+          <RequireAuth>
+            <AppShell />
+          </RequireAuth>
+        }
+      >
+        <Route
+          index
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <DashboardPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="registry"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <RegistryPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="registry/:cameraId"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <CameraDetailPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="map"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <MapPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="reports/gap-analysis"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <GapAnalysisPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="reports/health"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <HealthPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="wall"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <VideoWallPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="search/vehicles"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <VehicleSearchPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="alerts"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <AlertsPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="federation"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <FederationPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="vms/playback"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <PlaybackPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="admin/users"
+          element={
+            <RequireRole role="DEPT_ADMIN">
+              <Suspense fallback={<FullPageSpinner />}>
+                <UsersPage />
+              </Suspense>
+            </RequireRole>
+          }
+        />
+        <Route
+          path="admin/audit"
+          element={
+            <RequireRole role="DEPT_ADMIN">
+              <Suspense fallback={<FullPageSpinner />}>
+                <AuditPage />
+              </Suspense>
+            </RequireRole>
+          }
+        />
+      </Route>
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}

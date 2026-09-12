@@ -32,6 +32,12 @@ import { unByKey } from 'ol/Observable';
 
 import 'ol/ol.css';
 
+// Every call goes through the shared client so the bearer token is attached in
+// one place. Calling fetch() directly here would 401 against the authenticated
+// registry - which surfaces as "registry unreachable" and an empty map, with
+// nothing to say the session was the problem.
+import { api, request } from '../lib/api.js';
+
 /* ------------------------------------------------------------------ */
 /* Department styling                                                  */
 /* ------------------------------------------------------------------ */
@@ -137,6 +143,12 @@ export default function GISMap({
   apiBaseUrl = '/api/v1',
   webrtcBaseUrl = '/api/v2',
   alertsWsUrl = 'ws://central-command/alerts/p0',
+  // P0_ALERT_API_KEY. The API rejects the handshake with a policy-violation
+  // close (the browser reports it as 403) when a key is configured server-side
+  // and the socket presents none. A browser cannot set headers on a WebSocket,
+  // so the key has to ride the query string - which is why the API accepts
+  // ?token= as well as X-API-Key.
+  alertsToken = null,
   center = [72.5714, 23.0225], // [lon, lat] — Ahmedabad
   zoom = 11,
   vectorTileUrl = null,
@@ -164,9 +176,27 @@ export default function GISMap({
   const [selectedCamera, setSelectedCamera] = useState(null);
   const [health, setHealth] = useState(null);
   const [streamState, setStreamState] = useState({ status: 'idle', error: null });
+  // The MediaStream carrying the live tracks, held in state so the <video> can
+  // be attached by an effect once it exists. Assigning srcObject inside the
+  // ontrack handler instead would depend on the element already being mounted.
+  const [mediaStream, setMediaStream] = useState(null);
+  // What is actually arriving: MediaMTX's codec list plus the browser's own
+  // decode statistics. A codec the browser cannot decode looks exactly like a
+  // dead camera - both are a black tile - so this is the line that tells them
+  // apart.
+  const [mediaInfo, setMediaInfo] = useState(null);
   const [alertCount, setAlertCount] = useState(0);
   const [latestAlert, setLatestAlert] = useState(null);
   const [socketStatus, setSocketStatus] = useState('connecting');
+  // Registry load state is surfaced in the HUD rather than only logged: an
+  // empty map otherwise looks identical whether the fetch failed, the registry
+  // is empty, or every row was rejected for want of coordinates.
+  const [registryState, setRegistryState] = useState({
+    status: 'loading',
+    drawn: 0,
+    received: 0,
+    error: null,
+  });
 
   useEffect(() => {
     onAlertRef.current = onAlert;
@@ -292,12 +322,11 @@ export default function GISMap({
 
     (async () => {
       try {
-        const response = await fetch(`${apiBaseUrl}/cameras?limit=10000`, {
+        const body = await request(`${apiBaseUrl}/cameras`, {
+          method: 'GET',
+          params: { limit: 10000 },
           signal: controller.signal,
-          headers: { Accept: 'application/json' },
         });
-        if (!response.ok) throw new Error(`registry responded ${response.status}`);
-        const body = await response.json();
         const cameras = Array.isArray(body) ? body : body.items || [];
         const source = cameraSourceRef.current;
         if (!source) return;
@@ -319,9 +348,23 @@ export default function GISMap({
 
         source.clear();
         source.addFeatures(features);
+        setRegistryState({
+          status: 'loaded',
+          drawn: features.length,
+          received: cameras.length,
+          error: null,
+        });
       } catch (error) {
         if (error.name !== 'AbortError') {
           console.error('Camera registry load failed', error);
+          setRegistryState({
+            // "unreachable" and "not signed in" look identical on an empty map,
+            // and the fix is completely different, so they are named apart.
+            status: error.status === 401 || error.status === 403 ? 'unauthorised' : 'error',
+            drawn: 0,
+            received: 0,
+            error: error.detail || error.message,
+          });
         }
       }
     })();
@@ -357,12 +400,37 @@ export default function GISMap({
     [maxTrajectoryPoints],
   );
 
+  /** Zoom to every registered camera - the answer to "where are my markers?". */
+  const fitToCameras = useCallback(() => {
+    const source = cameraSourceRef.current;
+    const map = mapRef.current;
+    if (!source || !map || source.getFeatures().length === 0) return;
+    // maxZoom keeps a single camera from zooming to street level, which reads
+    // as a broken map rather than a fitted one.
+    map.getView().fit(source.getExtent(), {
+      padding: [60, 60, 60, 60],
+      maxZoom: 16,
+      duration: 250,
+    });
+  }, []);
+
   const clearTrajectory = useCallback(() => {
     trajectoryRef.current = [];
     trajectorySourceRef.current?.clear();
   }, []);
 
   /* ---------------- P0 alert socket ---------------- */
+
+  // Resolved against the page origin so a relative path works, then given the
+  // token. Built here rather than in the caller so the key is appended exactly
+  // once across reconnects.
+  const alertsSocketUrl = useMemo(() => {
+    const url = new URL(alertsWsUrl, window.location.href);
+    if (url.protocol === 'http:') url.protocol = 'ws:';
+    if (url.protocol === 'https:') url.protocol = 'wss:';
+    if (alertsToken) url.searchParams.set('token', alertsToken);
+    return url.toString();
+  }, [alertsWsUrl, alertsToken]);
 
   useEffect(() => {
     let disposed = false;
@@ -372,7 +440,7 @@ export default function GISMap({
       if (disposed) return;
       let socket;
       try {
-        socket = new WebSocket(alertsWsUrl);
+        socket = new WebSocket(alertsSocketUrl);
       } catch (error) {
         console.error('Alert socket construction failed', error);
         scheduleReconnect();
@@ -425,7 +493,18 @@ export default function GISMap({
       };
 
       socket.onerror = () => setSocketStatus('error');
-      socket.onclose = () => {
+      socket.onclose = (event) => {
+        // 1008 is the API refusing the credentials. Retrying cannot fix a wrong
+        // or missing key, and a backoff loop hides the cause behind a status
+        // that reads like a network blip - so say it and stop.
+        if (event.code === 1008) {
+          setSocketStatus('unauthorised - check VITE_P0_ALERT_TOKEN');
+          console.error(
+            'Alert socket rejected: the API requires P0_ALERT_API_KEY. Set VITE_P0_ALERT_TOKEN ' +
+              'in frontend/.env to the same value as P0_ALERT_API_KEY in .env, then restart vite.',
+          );
+          return;
+        }
         setSocketStatus('reconnecting');
         scheduleReconnect();
       };
@@ -449,7 +528,7 @@ export default function GISMap({
         socket.close();
       }
     };
-  }, [alertsWsUrl, appendTrajectoryHit]);
+  }, [alertsSocketUrl, appendTrajectoryHit]);
 
   /* ---------------- live camera health for the open popup ---------------- */
 
@@ -463,11 +542,12 @@ export default function GISMap({
 
     const poll = async () => {
       try {
-        const response = await fetch(
-          `${apiBaseUrl}/cameras/${encodeURIComponent(selectedCamera.id)}/health`,
-          { signal: controller.signal, headers: { Accept: 'application/json' } },
+        setHealth(
+          await request(`${apiBaseUrl}/cameras/${encodeURIComponent(selectedCamera.id)}/health`, {
+            method: 'GET',
+            signal: controller.signal,
+          }),
         );
-        if (response.ok) setHealth(await response.json());
       } catch (error) {
         if (error.name !== 'AbortError') setHealth(null);
       } finally {
@@ -486,6 +566,7 @@ export default function GISMap({
 
   const videoRef = useRef(null);
   const peerRef = useRef(null);
+  const connectTimerRef = useRef(null);
 
   const closeStream = useCallback(() => {
     const peer = peerRef.current;
@@ -496,7 +577,13 @@ export default function GISMap({
       peer.close();
     }
     peerRef.current = null;
+    if (connectTimerRef.current) {
+      clearTimeout(connectTimerRef.current);
+      connectTimerRef.current = null;
+    }
     if (videoRef.current) videoRef.current.srcObject = null;
+    setMediaStream(null);
+    setMediaInfo(null);
     setStreamState({ status: 'idle', error: null });
   }, []);
 
@@ -518,10 +605,47 @@ export default function GISMap({
       peerRef.current = peer;
       peer.addTransceiver('video', { direction: 'recvonly' });
       peer.addTransceiver('audio', { direction: 'recvonly' });
+
+      // One stream for the whole session, built here rather than taken from the
+      // event. event.streams is populated from the answer's msid, which a WHEP
+      // server is not obliged to send - and when it is absent, streams[0] is
+      // undefined, srcObject becomes undefined, and the tile stays black while
+      // the UI happily reports "live". Adding the track ourselves cannot fail
+      // that way.
+      const stream = new MediaStream();
       peer.ontrack = (event) => {
-        if (videoRef.current) videoRef.current.srcObject = event.streams[0];
-        setStreamState({ status: 'live', error: null });
+        if (peerRef.current !== peer) return; // superseded by a newer request
+        const [remote] = event.streams;
+        if (remote) {
+          remote.getTracks().forEach((track) => {
+            if (!stream.getTracks().includes(track)) stream.addTrack(track);
+          });
+        } else {
+          stream.addTrack(event.track);
+        }
+        setMediaStream(stream);
+        // Only a video track means there is a picture to show. Flipping to
+        // "live" on an audio-first track would report success while the tile is
+        // still empty.
+        if (event.track.kind === 'video') {
+          if (connectTimerRef.current) {
+            clearTimeout(connectTimerRef.current);
+            connectTimerRef.current = null;
+          }
+          setStreamState({ status: 'live', error: null });
+        }
       };
+
+      // Signalling can succeed while media never arrives. Without this the
+      // button sits disabled on "Negotiating…" forever, which reads as a hung
+      // console rather than a camera that did not answer.
+      connectTimerRef.current = setTimeout(() => {
+        if (peerRef.current !== peer) return;
+        setStreamState({
+          status: 'error',
+          error: 'no video track arrived within 20s',
+        });
+      }, 20_000);
 
       // Without this the UI sits on "Negotiating..." forever whenever
       // signalling succeeds but media never arrives - no timeout, no error,
@@ -541,24 +665,104 @@ export default function GISMap({
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
 
-      const response = await fetch(`${webrtcBaseUrl}/webrtc/offer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({
-          camera_id: selectedCamera.id,
-          sdp: peer.localDescription.sdp,
-          type: peer.localDescription.type,
-        }),
+      const answer = await api.post(`${webrtcBaseUrl}/webrtc/offer`, {
+        camera_id: selectedCamera.id,
+        sdp: peer.localDescription.sdp,
+        type: peer.localDescription.type,
       });
-      if (!response.ok) throw new Error(`relay responded ${response.status}`);
-
-      const answer = await response.json();
       await peer.setRemoteDescription({ type: answer.type || 'answer', sdp: answer.sdp });
+
+      // Ask the media server what it is actually sending. The answer SDP does
+      // not say, and the codec is the difference between "camera is dead" and
+      // "this browser cannot decode what the camera sends".
+      api
+        .get(`${webrtcBaseUrl}/streams/${selectedCamera.id}/state`)
+        .then((state) => {
+          if (!state || peerRef.current !== peer) return;
+          setMediaInfo((current) => ({ ...current, tracks: state.tracks || [] }));
+        })
+        .catch(() => {
+          /* Statistics are a convenience; never fail a working stream over them. */
+        });
     } catch (error) {
       closeStream();
       setStreamState({ status: 'error', error: error.message });
     }
   }, [closeStream, selectedCamera?.id, webrtcBaseUrl]);
+
+  // Attach the stream once both it and the element exist. Doing this in an
+  // effect rather than in ontrack means the assignment cannot be lost to
+  // mount ordering, and gives somewhere to report a blocked autoplay: a
+  // muted video normally plays on its own, but a rejected play() would
+  // otherwise be a silent black tile.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !mediaStream) return;
+    if (video.srcObject !== mediaStream) video.srcObject = mediaStream;
+    video.play().catch((error) => {
+      if (error.name === 'AbortError') return; // superseded by the next load
+      setStreamState({
+        status: 'error',
+        error: `browser refused to play the stream (${error.name})`,
+      });
+    });
+  }, [mediaStream, streamState.status]);
+
+  // While a stream is live, read the browser's own decode counters. Bytes
+  // arriving with framesDecoded stuck at zero is the signature of an
+  // undecodable codec, and is otherwise indistinguishable from a dead camera.
+  useEffect(() => {
+    if (streamState.status !== 'live') return undefined;
+    const peer = peerRef.current;
+    if (!peer?.getStats) return undefined;
+
+    let disposed = false;
+    let previous = null;
+
+    const sample = async () => {
+      let report;
+      try {
+        report = await peer.getStats();
+      } catch {
+        return;
+      }
+      if (disposed || peerRef.current !== peer) return;
+
+      let inbound = null;
+      let codec = null;
+      report.forEach((entry) => {
+        if (entry.type === 'inbound-rtp' && entry.kind === 'video') inbound = entry;
+      });
+      if (inbound?.codecId) {
+        const entry = report.get(inbound.codecId);
+        // mimeType is "video/H264"; the half after the slash is the name.
+        if (entry?.mimeType) codec = entry.mimeType.split('/').pop();
+      }
+      if (!inbound) return;
+
+      const elapsed = previous ? (inbound.timestamp - previous.timestamp) / 1000 : 0;
+      const fps =
+        elapsed > 0 ? Math.round((inbound.framesDecoded - previous.framesDecoded) / elapsed) : null;
+      previous = inbound;
+
+      setMediaInfo((current) => ({
+        ...current,
+        codec,
+        bytesReceived: inbound.bytesReceived || 0,
+        framesDecoded: inbound.framesDecoded || 0,
+        width: inbound.frameWidth || null,
+        height: inbound.frameHeight || null,
+        fps,
+      }));
+    };
+
+    sample();
+    const timer = setInterval(sample, 2000);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [streamState.status]);
 
   useEffect(() => closeStream, [closeStream]);
 
@@ -569,6 +773,33 @@ export default function GISMap({
     closeStream();
     setSelectedCamera(null);
   }, [closeStream]);
+
+  // One sentence describing what the tile is doing, so a black picture is never
+  // unexplained. Codec names come from MediaMTX (what is sent) and from the
+  // browser's stats (what was decoded); they agree unless the browser cannot
+  // decode it, which is exactly the case worth naming.
+  const mediaSummary = useMemo(() => {
+    if (!mediaInfo) return null;
+    const { codec, tracks, bytesReceived = 0, framesDecoded = 0, width, height, fps } = mediaInfo;
+    const sent = (tracks || []).join(', ');
+    const name = codec || sent || 'unknown codec';
+
+    if (framesDecoded > 0) {
+      const size = width && height ? ` · ${width}×${height}` : '';
+      const rate = fps ? ` · ${fps} fps` : '';
+      return { text: `${name}${size}${rate}`, warn: false };
+    }
+    if (bytesReceived > 0) {
+      const megabytes = (bytesReceived / 1_000_000).toFixed(1);
+      // H.265 is the usual answer: MediaMTX does not transcode for WebRTC and
+      // desktop Chrome will not decode it there.
+      const cause = /265|hevc/i.test(sent || name)
+        ? `this browser cannot decode ${sent || name} over WebRTC`
+        : 'no frames decoded';
+      return { text: `receiving ${megabytes} MB, 0 frames decoded — ${cause}`, warn: true };
+    }
+    return { text: `${name} · waiting for frames`, warn: false };
+  }, [mediaInfo]);
 
   const healthBadge = useMemo(() => {
     const status = String(health?.status || selectedCamera?.status || 'UNKNOWN').toUpperCase();
@@ -588,6 +819,24 @@ export default function GISMap({
           <span style={styles.muted}>{socketStatus}</span>
         </div>
         <div style={styles.hudRow}>
+          <span style={styles.muted}>Cameras</span>
+          {registryState.status === 'unauthorised' ? (
+            <strong style={{ color: '#fca5a5' }}>not signed in</strong>
+          ) : registryState.status === 'error' ? (
+            <strong style={{ color: '#fca5a5' }}>registry unreachable</strong>
+          ) : (
+            <>
+              <strong>{registryState.status === 'loading' ? '…' : registryState.drawn}</strong>
+              {/* A row without coordinates is silently undrawable, so say so. */}
+              {registryState.received > registryState.drawn && (
+                <span style={styles.muted}>
+                  ({registryState.received - registryState.drawn} without coordinates)
+                </span>
+              )}
+            </>
+          )}
+        </div>
+        <div style={styles.hudRow}>
           <span style={styles.muted}>Alerts</span>
           <strong>{alertCount}</strong>
           <span style={styles.muted}>Track points</span>
@@ -599,9 +848,14 @@ export default function GISMap({
             {latestAlert.camera_id || '—'}
           </div>
         )}
-        <button type="button" onClick={clearTrajectory} style={styles.secondaryButton}>
-          Clear trajectory
-        </button>
+        <div style={styles.hudRow}>
+          <button type="button" onClick={fitToCameras} style={styles.secondaryButton}>
+            Fit cameras
+          </button>
+          <button type="button" onClick={clearTrajectory} style={styles.secondaryButton}>
+            Clear trajectory
+          </button>
+        </div>
         <div style={styles.legend}>
           {['POLICE', 'RTO', 'CIVIL_SUPPLIES'].map((dept) => (
             <span key={dept} style={styles.legendItem}>
@@ -657,6 +911,11 @@ export default function GISMap({
                 muted
                 style={styles.video}
               />
+            )}
+            {streamState.status !== 'idle' && mediaSummary && (
+              <p style={mediaSummary.warn ? styles.mediaWarning : styles.mediaInfo}>
+                {mediaSummary.text}
+              </p>
             )}
             {streamState.status === 'error' && (
               <p style={styles.error}>Stream failed: {streamState.error}</p>
@@ -732,7 +991,20 @@ const styles = {
   details: { display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 10px', margin: 0 },
   dt: { color: '#6b7280' },
   dd: { margin: 0, display: 'flex', alignItems: 'center', gap: 6 },
-  video: { width: '100%', marginTop: 10, borderRadius: 6, background: '#000' },
+  // A frameless <video> has an intrinsic size of zero, so without a reserved
+  // box a waiting stream looks like nothing rendered at all.
+  video: {
+    width: '100%',
+    marginTop: 10,
+    borderRadius: 6,
+    background: '#000',
+    aspectRatio: '16 / 9',
+    minHeight: 120,
+    objectFit: 'contain',
+    display: 'block',
+  },
+  mediaInfo: { color: '#6b7280', fontSize: 11, margin: '6px 0 0' },
+  mediaWarning: { color: '#b45309', fontSize: 11, margin: '6px 0 0' },
   error: { color: '#b91c1c', margin: '8px 0 0' },
   primaryButton: {
     marginTop: 10,

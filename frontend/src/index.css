@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 /* The map component sizes itself to 100% height, so every ancestor up to <html>
    must have a real height or the console collapses to its 480px minimum. */
 html,
@@ -9,14 +13,44 @@ body,
 }
 
 body {
-  background: #0b0f14;
-  color: #e6edf3;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  @apply bg-ink-900 text-slate-200 font-sans antialiased;
   overflow: hidden;
 }
 
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
+/* OpenLayers ships light-themed controls that sit badly on a dark console. */
+.ol-control button {
+  @apply bg-ink-800/90 text-slate-200 border border-ink-700;
+}
+.ol-control button:hover {
+  @apply bg-ink-700;
+}
+.ol-attribution {
+  @apply bg-ink-900/70 text-[10px] text-slate-400;
+}
+
+/* Scrollbars: visible enough to grab, quiet enough to ignore. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2b3847 transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  @apply bg-ink-600 rounded-full border-2 border-solid border-transparent bg-clip-padding;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Respect a reduced-motion preference: an operations console runs all day. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
