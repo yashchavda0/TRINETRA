@@ -528,6 +528,22 @@ _SEVERITY_BY_CLASSIFICATION: Final = {
     MatchClassification.NONE.value: "P2",
 }
 
+# Alerts deduplicate on alert_id, which hashes the sighting. The timestamp is
+# rounded into a bucket so that two independent producers describing the same
+# vehicle at the same camera - the edge analytics and the ANPR reader - collapse
+# into one alert. Hashing the exact millisecond instead means a one-millisecond
+# clock skew between them sends every operator two copies of the same alert.
+ALERT_ID_BUCKET_MS: Final = 5_000
+
+
+def build_alert_id(
+    plate: str | None, camera_id: str | None, detected_at_ms: int, classification: str
+) -> str:
+    """Deterministic alert id for one sighting, stable across producers."""
+    bucket = (int(detected_at_ms) // ALERT_ID_BUCKET_MS) * ALERT_ID_BUCKET_MS
+    seed = f"{plate}|{camera_id}|{bucket}|{classification}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:32]
+
 
 @dataclass(slots=True)
 class ThreatAlert:
@@ -652,9 +668,8 @@ class AlertDispatcher:
 
         plate = cctns_result.get("plate_number") or vahan.get("plate_number")
         detected = detected_at or cctns_result.get("checked_at") or now_epoch_ms()
-        seed = f"{plate}|{camera_id}|{detected}|{classification}"
         return ThreatAlert(
-            alert_id=hashlib.sha256(seed.encode()).hexdigest()[:32],
+            alert_id=build_alert_id(plate, camera_id, int(detected), classification),
             priority=_SEVERITY_BY_CLASSIFICATION.get(classification, "P1"),
             classification=classification,
             plate_number=plate,

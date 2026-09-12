@@ -21,8 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/gin-gonic/gin"
+	kafka "github.com/segmentio/kafka-go"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -111,48 +111,21 @@ func (p *TCPConnectionPool) Close() {
 }
 
 type IngestionGateway struct {
-	producer *kafka.Producer
-	topic    string
-
-	deliveryWG sync.WaitGroup
+	writer *kafka.Writer
+	topic  string
 }
 
-func NewIngestionGateway(producer *kafka.Producer, topic string) *IngestionGateway {
-	g := &IngestionGateway{
-		producer: producer,
-		topic:    topic,
-	}
-
-	g.deliveryWG.Add(1)
-	go g.deliveryLoop()
-	return g
-}
-
-func (g *IngestionGateway) deliveryLoop() {
-	defer g.deliveryWG.Done()
-	for ev := range g.producer.Events() {
-		msg, ok := ev.(*kafka.Message)
-		if !ok {
-			continue
-		}
-		if msg.TopicPartition.Error != nil {
-			log.Printf("kafka delivery failure topic=%s partition=%d offset=%v err=%v",
-				safeTopicName(msg.TopicPartition.Topic),
-				msg.TopicPartition.Partition,
-				msg.TopicPartition.Offset,
-				msg.TopicPartition.Error,
-			)
-		}
+func NewIngestionGateway(writer *kafka.Writer, topic string) *IngestionGateway {
+	return &IngestionGateway{
+		writer: writer,
+		topic:  topic,
 	}
 }
 
-func (g *IngestionGateway) Close(flushTimeout time.Duration) {
-	remaining := g.producer.Flush(int(flushTimeout.Milliseconds()))
-	if remaining > 0 {
-		log.Printf("kafka flush timeout, %d message(s) still pending", remaining)
+func (g *IngestionGateway) Close() {
+	if err := g.writer.Close(); err != nil {
+		log.Printf("kafka writer close error: %v", err)
 	}
-	g.producer.Close()
-	g.deliveryWG.Wait()
 }
 
 func (g *IngestionGateway) IngestHandler(c *gin.Context) {
@@ -198,17 +171,16 @@ func (g *IngestionGateway) IngestHandler(c *gin.Context) {
 	}
 
 	key := strconv.FormatInt(int64(event.DepartmentCode), 10)
-	err = g.producer.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &g.topic, Partition: kafka.PartitionAny},
-		Key:            []byte(key),
-		Value:          body,
+	err = g.writer.WriteMessages(c.Request.Context(), kafka.Message{
+		Key:   []byte(key),
+		Value: body,
 		Headers: []kafka.Header{
 			{Key: "event_id", Value: []byte(eventID)},
 			{Key: "camera_id", Value: []byte(event.CameraID)},
 		},
-	}, nil)
+	})
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("kafka produce enqueue failed: %v", err)})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("kafka produce failed: %v", err)})
 		return
 	}
 
@@ -438,22 +410,16 @@ func main() {
 	}
 	cancel()
 
-	producer, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers":          bootstrapServers,
-		"acks":                       "1",
-		"compression.type":           "snappy",
-		"linger.ms":                  10,
-		"batch.num.messages":         10000,
-		"go.delivery.reports":        true,
-		"socket.keepalive.enable":    true,
-		"queue.buffering.max.kbytes": 512000,
-	})
-	if err != nil {
-		log.Fatalf("unable to create Kafka producer: %v", err)
+	writer := &kafka.Writer{
+		Addr:         kafka.TCP(strings.Split(bootstrapServers, ",")...),
+		Topic:        kafkaTopic,
+		Balancer:     &kafka.LeastBytes{},
+		BatchTimeout: 10 * time.Millisecond,
+		Async:        false,
 	}
 
-	gateway := NewIngestionGateway(producer, kafkaTopic)
-	defer gateway.Close(5 * time.Second)
+	gateway := NewIngestionGateway(writer, kafkaTopic)
+	defer gateway.Close()
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()

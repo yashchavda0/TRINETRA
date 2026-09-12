@@ -1,0 +1,22 @@
+# Multi-stage slim Docker build for ingestion_gateway
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Cache dependencies
+COPY go.mod go.sum* ./
+RUN go mod download
+
+# Copy source code and build statically stripped pure-Go binary
+COPY . .
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/ingestion_gateway ./cmd/ingestion_gateway
+
+# Minimal runtime image
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY --from=builder /bin/ingestion_gateway /usr/local/bin/ingestion_gateway
+
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/ingestion_gateway"]

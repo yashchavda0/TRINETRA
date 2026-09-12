@@ -8,6 +8,18 @@ asyncpg>=0.29.0,<1.0.0
 pydantic>=2.6.0,<3.0.0
 pydantic-settings>=2.2.0,<3.0.0
 
+# Authentication. bcrypt is used directly rather than through passlib, which
+# reads bcrypt.__about__ - removed in bcrypt 4.x - and logs a traceback on every
+# hash. PyJWT signs and verifies the access/refresh tokens.
+bcrypt>=4.1.0,<6.0.0
+PyJWT>=2.8.0,<3.0.0
+
+# Multipart form parsing, required by FastAPI for the bulk-import file upload.
+python-multipart>=0.0.9,<1.0.0
+
+# Registry bulk import/export. openpyxl handles .xlsx; CSV uses the stdlib.
+openpyxl>=3.1.0,<4.0.0
+
 # Protobuf runtime plus the compiler used to generate the Python bindings for
 # proto/surveillance_event.proto. Generate before running the worker:
 #   python -m grpc_tools.protoc -I proto --python_out=generated proto/surveillance_event.proto

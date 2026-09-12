@@ -1,22 +1,28 @@
-"""Model 4 handoff worker: the driver that ties the pipeline together.
+"""Predictive handoff worker: the driver that ties the pipeline together.
 
 Run with:
     python -m workers.handoff_worker
 
 What it does, per message on ``surveillance-events-raw``:
 
-1. Decodes the protobuf ``SurveillanceEvent`` produced by cmd/ingestion_gateway.
-2. Enforces the 512-dimension ``feature_embedding`` invariant. The gateway parses
-   only tags 1-4 and skips the embedding entirely, so this is the first and only
-   place the contract is actually checked.
-3. Persists the detection idempotently on ``event_id``.
-4. Resolves the detection to a Re-ID identity through
+1. Decodes the protobuf ``SurveillanceEvent`` produced by cmd/ingestion_gateway
+   or by the ANPR reader, and rejects one whose identifiers are unusable rather
+   than letting it fail inside the INSERT and vanish.
+2. Persists the detection idempotently on ``event_id``, including the plate.
+3. When - and only when - a valid 512-float ``feature_embedding`` is present,
+   resolves the detection to a Re-ID identity through
    :class:`engine.vector_matcher.VectorMatcher`, creating a new target when
-   nothing matches above threshold.
-5. Updates the wake-up state machine: confirms a predicted handoff when the
-   target appears on a PRE_ACTIVATED camera, and releases the camera it left.
-6. Screens any plate read against eGujCop/VAHAN and publishes the resulting P0
-   alert to the API's fan-out endpoint.
+   nothing matches above threshold, and updates the wake-up state machine.
+4. Whatever the embedding, matches any plate against the watchlist and screens
+   it against eGujCop/VAHAN, publishing the resulting alert to the API's
+   fan-out endpoint.
+
+Point 3 and point 4 are deliberately independent. Gating plate handling on a
+Re-ID identity made every plate read from an embedding-less producer invisible:
+stored, never screened, never alerted.
+
+Note on naming: this is the *predictive handoff engine*, which the tender counts
+as one component of its Model 4 (Central VMS). It is not Model 4 itself.
 
 A scheduler task runs alongside the consumer and supplies the two callers the
 engine has always been missing: ``CameraStateMachine.tick()`` (so cooldowns and
@@ -33,6 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import hashlib
 import json
 import logging
 import math
@@ -49,8 +57,12 @@ import torch
 
 from adapters.external_db_bridge import (
     AlertDispatcher,
+    ThreatAlert,
     VahanAdapter,
+    build_alert_id,
     eGujCopAdapter,
+    normalise_plate,
+    now_epoch_ms,
     screen_target,
 )
 from app import database
@@ -95,7 +107,7 @@ _INSERT_DETECTION_SQL: Final = """
         event_id, camera_id, department_id, department_code_tag, timestamp_utc_ms,
         object_class, bbox_x_min, bbox_y_min, bbox_x_max, bbox_y_max,
         attributes, track_id, target_id, detection_geom, azimuth_degrees,
-        embedding_accepted
+        embedding_accepted, plate_number, plate_confidence, snapshot_uri
     )
     VALUES (
         $1, $2, $3, $4, $5,
@@ -105,7 +117,7 @@ _INSERT_DETECTION_SQL: Final = """
             WHEN $14::double precision IS NULL OR $15::double precision IS NULL THEN NULL
             ELSE ST_SetSRID(ST_MakePoint($14, $15), 4326)
         END,
-        $16, $17
+        $16, $17, $18, $19, $20
     )
     ON CONFLICT (event_id) DO NOTHING
     RETURNING event_id
@@ -157,6 +169,21 @@ _LOAD_EMBEDDINGS_SQL: Final = """
     ORDER BY last_seen_utc_ms DESC
     LIMIT $1
 """
+
+# Both liveness conditions are applied here, at read time. `expires_at` has no
+# sweeper anywhere in the system, so an expired entry stays in the table and
+# must be filtered out on every load.
+_LOAD_WATCHLIST_SQL: Final = """
+    SELECT id::text, plate_number, target_id, classification, priority,
+           reason, case_reference, department_id
+    FROM watchlist
+    WHERE is_active
+      AND (expires_at IS NULL OR expires_at > clock_timestamp())
+"""
+
+# Ceiling on the screening-cooldown map before it is swept. High enough that a
+# busy fleet never sweeps on the hot path, low enough to bound memory.
+_SCREEN_CACHE_MAX: Final = 50_000
 
 
 def haversine_meters(
@@ -223,7 +250,39 @@ class DecodedEvent:
 
     @property
     def plate_number(self) -> str | None:
-        return self.attributes.get("license_plate")
+        """The plate as read, normalised to the form the registry stores.
+
+        Normalising here rather than at each use is what makes the stored
+        `detections.plate_number`, the watchlist comparison and the search
+        query all agree on one spelling. A producer that sends "GJ 01 AB 1234"
+        must be findable by someone typing "GJ01AB1234".
+        """
+        raw = self.attributes.get("license_plate")
+        if not raw:
+            return None
+        try:
+            return normalise_plate(raw)
+        except ValueError:
+            # Not a plausible registration mark. Keep the raw text - it is
+            # evidence of what the reader saw - but it will not match a
+            # watchlist entry, which is the correct outcome for a misread.
+            return raw.strip().upper()[:24] or None
+
+    @property
+    def plate_confidence(self) -> float | None:
+        """ANPR confidence, when the producer supplied one."""
+        raw = self.attributes.get("license_plate_conf")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if 0.0 <= value <= 1.0 else None
+
+    @property
+    def snapshot_uri(self) -> str | None:
+        return self.attributes.get("snapshot_uri")
 
 
 def decode_event(raw: bytes) -> DecodedEvent:
@@ -307,9 +366,21 @@ class HandoffWorker:
         self._publisher: httpx.AsyncClient | None = None
         self._stop = asyncio.Event()
 
+        # Watchlist, indexed twice because a plate read and a Re-ID identity are
+        # two different match paths. Swapped wholesale under the lock, never
+        # mutated in place, so a reader always sees one consistent generation.
+        self._watchlist_plates: dict[str, dict[str, Any]] = {}
+        self._watchlist_targets: dict[str, dict[str, Any]] = {}
+        self._watchlist_lock = asyncio.Lock()
+
+        # (plate, camera_id) -> monotonic time of the last external screening.
+        self._screened: dict[tuple[str, str], float] = {}
+
         self.processed = 0
         self.rejected_embeddings = 0
+        self.rejected_identifiers = 0
         self.alerts_published = 0
+        self.watchlist_hits = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -317,6 +388,10 @@ class HandoffWorker:
         await database.connect(self.settings)
         await self._reload_graph()
         await self._rehydrate_targets()
+        # Loaded here rather than left to the scheduler: that loop sleeps at the
+        # top, so anything not loaded now is cold for a full interval - and a
+        # cold watchlist means a wanted vehicle passes unremarked.
+        await self._reload_watchlist()
 
         self._publisher = httpx.AsyncClient(
             timeout=httpx.Timeout(5.0),
@@ -349,6 +424,8 @@ class HandoffWorker:
                 "group": self.settings.kafka_consumer_group,
                 "graph_nodes": self.graph.num_nodes if self.graph else 0,
                 "graph_edges": self.graph.num_edges if self.graph else 0,
+                "watchlist_plates": len(self._watchlist_plates),
+                "watchlist_targets": len(self._watchlist_targets),
             },
         )
 
@@ -372,6 +449,8 @@ class HandoffWorker:
             extra={
                 "processed": self.processed,
                 "rejected_embeddings": self.rejected_embeddings,
+                "rejected_identifiers": self.rejected_identifiers,
+                "watchlist_hits": self.watchlist_hits,
                 "alerts_published": self.alerts_published,
             },
         )
@@ -446,6 +525,50 @@ class HandoffWorker:
         if restored:
             logger.info("rehydrated %d target embedding(s) from PostgreSQL", restored)
 
+    async def _reload_watchlist(self) -> None:
+        """Rebuild the watchlist indexes from the database.
+
+        Built off to the side and swapped under the lock, the same shape as
+        _reload_graph: a failed refresh must leave the previous watchlist in
+        place rather than empty it, because an empty watchlist silently stops
+        matching instead of failing loudly.
+        """
+        try:
+            pool = database.get_pool()
+            async with pool.acquire() as connection:
+                rows = await connection.fetch(_LOAD_WATCHLIST_SQL)
+        except (asyncpg.PostgresError, RuntimeError):
+            logger.exception("watchlist reload failed; keeping the previous copy")
+            return
+
+        by_plate: dict[str, dict[str, Any]] = {}
+        by_target: dict[str, dict[str, Any]] = {}
+
+        for row in rows:
+            entry = dict(row)
+            if entry.get("plate_number"):
+                # Normalise on load so a hand-typed entry matches a reader's
+                # output. The unique partial index guarantees one active row per
+                # plate string, but not that the string is well formed.
+                try:
+                    by_plate[normalise_plate(entry["plate_number"])] = entry
+                except ValueError:
+                    logger.warning(
+                        "watchlist entry has an unusable plate; skipping",
+                        extra={"watchlist_id": entry["id"], "plate": entry["plate_number"]},
+                    )
+            if entry.get("target_id"):
+                by_target[entry["target_id"]] = entry
+
+        async with self._watchlist_lock:
+            self._watchlist_plates = by_plate
+            self._watchlist_targets = by_target
+
+        logger.info(
+            "watchlist refreshed",
+            extra={"plates": len(by_plate), "targets": len(by_target)},
+        )
+
     # -- consumer loop -----------------------------------------------------
 
     async def consume_forever(self) -> None:
@@ -473,16 +596,52 @@ class HandoffWorker:
                 # partition. The payload is on the bus if it needs replaying.
                 logger.exception("event processing failed")
 
-            with contextlib.suppress(KafkaException):
-                await asyncio.to_thread(self._consumer.commit, message, False)
+            # Keyword arguments are load-bearing: Consumer.commit's signature is
+            # (message=None, offsets=None, asynchronous=True), so commit(msg,
+            # False) binds False to `offsets` and raises TypeError - which is
+            # not a KafkaException, escapes any suppression, and kills this
+            # loop while the rest of the worker keeps running.
+            try:
+                await asyncio.to_thread(
+                    functools.partial(
+                        self._consumer.commit, message=message, asynchronous=False
+                    )
+                )
+            except KafkaException as exc:
+                # A failed commit means this message may be redelivered. The
+                # detection insert is idempotent on event_id, so a replay is
+                # harmless - but it must be visible rather than silent.
+                logger.warning("offset commit failed", extra={"error": str(exc)})
 
     async def _handle_message(self, raw: bytes | None) -> None:
         if not raw:
             return
 
         event = decode_event(raw)
+
+        # An event whose identifiers are unusable cannot be stored: event_id is
+        # the primary key and camera_id is NOT NULL, so a malformed one raises
+        # inside the INSERT, the offset is committed anyway, and the event
+        # disappears without trace. Reject it here, where it can be counted.
+        if _as_uuid(event.event_id) is None or _as_uuid(event.camera_id) is None:
+            self.rejected_identifiers += 1
+            logger.warning(
+                "discarding event with unusable identifiers",
+                extra={
+                    "event_id": event.event_id,
+                    "camera_id": event.camera_id,
+                },
+            )
+            return
+
+        # A 512-float embedding is required for re-identification and for
+        # nothing else. An ANPR reader publishes plates without one, and such an
+        # event is still a real observation: it is persisted, and its plate is
+        # still screened. Only the Re-ID and handoff paths are skipped.
         embedding_ok = len(event.embedding) == EMBEDDING_DIM
-        if not embedding_ok:
+        if not embedding_ok and event.embedding:
+            # Empty is the normal, expected shape from a plate-only producer.
+            # A wrong *length* is a contract violation and worth a warning.
             self.rejected_embeddings += 1
             logger.warning(
                 "rejecting feature_embedding of wrong length",
@@ -502,13 +661,15 @@ class HandoffWorker:
         await self._persist_detection(event, target_id, embedding_ok)
         self.processed += 1
 
-        if target_id is None:
-            return
+        # Re-identification state only means something when there is an identity.
+        if target_id is not None:
+            await self._advance_states(event, target_id)
 
-        await self._advance_states(event, target_id)
-
+        # Plate handling is deliberately outside that guard. Gating it on
+        # target_id made every plate read from an embedding-less producer
+        # invisible: stored, never screened, never alerted.
         if event.plate_number:
-            await self._screen_plate(event, target_id)
+            await self._handle_plate(event, target_id)
 
         logger.info(
             "detection processed",
@@ -516,6 +677,7 @@ class HandoffWorker:
                 "event_id": event.event_id,
                 "camera_id": event.camera_id,
                 "target_id": target_id,
+                "plate_number": event.plate_number,
                 "similarity": round(similarity, 4) if similarity is not None else None,
                 "object_class": event.object_class,
             },
@@ -693,16 +855,114 @@ class HandoffWorker:
                 event.latitude,  # $15 -> ST_MakePoint Y
                 event.azimuth_degrees,
                 embedding_ok,
+                event.plate_number,
+                event.plate_confidence,
+                event.snapshot_uri,
             )
 
-    # -- external screening ------------------------------------------------
+    # -- plate handling ----------------------------------------------------
 
-    async def _screen_plate(self, event: DecodedEvent, target_id: str) -> None:
-        """Run the registry lookups and publish any resulting threat alert."""
+    async def _handle_plate(self, event: DecodedEvent, target_id: str | None) -> None:
+        """Match a plate against the watchlist, then screen it externally.
+
+        Runs whether or not the event carried a Re-ID embedding: a plate read is
+        an observation in its own right, and an ANPR reader publishes nothing
+        else.
+
+        Screening is rate-limited per (plate, camera). A vehicle sitting in view
+        produces a plate on every sampled frame, and each unthrottled screening
+        costs two outbound calls to the state registries.
+        """
         plate = event.plate_number
         if not plate:
             return
 
+        # The watchlist is local and authoritative for "we are looking for this
+        # one", so it is checked first and is never rate-limited - a hit must
+        # not be suppressed because the same vehicle was screened moments ago.
+        await self._match_watchlist(event, plate, target_id)
+
+        if not self._should_screen(plate, event.camera_id):
+            return
+
+        await self._screen_plate(event, plate, target_id)
+
+    def _should_screen(self, plate: str, camera_id: str) -> bool:
+        """True when this (plate, camera) pair is outside its cooldown."""
+        key = (plate, camera_id)
+        now = time.monotonic()
+        last = self._screened.get(key)
+        if last is not None and now - last < self.settings.plate_screen_ttl_seconds:
+            return False
+
+        self._screened[key] = now
+        # Opportunistic eviction: the map is only ever read by this method, so a
+        # sweep here is cheaper than a background task and cannot leak.
+        if len(self._screened) > _SCREEN_CACHE_MAX:
+            cutoff = now - self.settings.plate_screen_ttl_seconds
+            self._screened = {
+                pair: seen for pair, seen in self._screened.items() if seen >= cutoff
+            }
+        return True
+
+    async def _match_watchlist(
+        self, event: DecodedEvent, plate: str, target_id: str | None
+    ) -> None:
+        """Raise an alert when this plate or identity is on the watchlist."""
+        entry = self._watchlist_plates.get(plate)
+        if entry is None and target_id is not None:
+            entry = self._watchlist_targets.get(target_id)
+        if entry is None:
+            return
+
+        # build_alert only accepts adapter-shaped results and derives priority
+        # from a three-key map, while a watchlist entry carries its own
+        # classification and priority. The ThreatAlert is therefore constructed
+        # directly - but with the same alert_id seed, so ON CONFLICT (alert_id)
+        # still collapses a repeat sighting into one row.
+        classification = entry["classification"]
+        alert = ThreatAlert(
+            alert_id=build_alert_id(
+                plate, event.camera_id, event.timestamp_utc_ms, classification
+            ),
+            priority=entry["priority"],
+            classification=classification,
+            plate_number=plate,
+            camera_id=event.camera_id,
+            latitude=event.latitude,
+            longitude=event.longitude,
+            detected_at=event.timestamp_utc_ms,
+            dispatched_at=now_epoch_ms(),
+            confidence=event.plate_confidence or 1.0,
+            vehicle={},
+            subject={
+                "reason": entry["reason"],
+                "case_references": [entry["case_reference"]] if entry["case_reference"] else [],
+            },
+            evidence={
+                "source": "WATCHLIST",
+                "watchlist_id": entry["id"],
+                "track_id": event.track_id or target_id,
+                "snapshot_uri": event.snapshot_uri,
+            },
+        )
+
+        self.watchlist_hits += 1
+        logger.warning(
+            "watchlist hit",
+            extra={
+                "plate": plate,
+                "camera_id": event.camera_id,
+                "classification": classification,
+                "priority": entry["priority"],
+            },
+        )
+        await self._publish_alert(alert.to_dict())
+
+    async def _screen_plate(
+        self, event: DecodedEvent, plate: str, target_id: str | None
+    ) -> None:
+        """Run the registry lookups and publish any resulting threat alert."""
         try:
             result = await screen_target(
                 plate,
@@ -727,6 +987,7 @@ class HandoffWorker:
             longitude=event.longitude,
             detected_at=event.timestamp_utc_ms,
             track_id=event.track_id or target_id,
+            snapshot_uri=event.snapshot_uri,
         )
         if alert is None:
             return
@@ -773,6 +1034,7 @@ class HandoffWorker:
     async def scheduler_forever(self) -> None:
         """Expire state, purge stale targets and run handoff prediction."""
         last_graph_reload = time.monotonic()
+        last_watchlist_reload = time.monotonic()
 
         while not self._stop.is_set():
             await asyncio.sleep(self.settings.scheduler_interval_seconds)
@@ -794,6 +1056,16 @@ class HandoffWorker:
                 ):
                     await self._reload_graph()
                     last_graph_reload = time.monotonic()
+
+                # Refreshed far more often than the graph: adding a stolen
+                # vehicle to the watchlist should take effect in seconds, not
+                # after the five-minute graph cycle.
+                if (
+                    time.monotonic() - last_watchlist_reload
+                    >= self.settings.watchlist_reload_seconds
+                ):
+                    await self._reload_watchlist()
+                    last_watchlist_reload = time.monotonic()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -873,6 +1145,26 @@ async def run() -> int:
 
     consumer_task = asyncio.create_task(worker.consume_forever(), name="kafka-consumer")
     scheduler_task = asyncio.create_task(worker.scheduler_forever(), name="scheduler")
+
+    # Neither task may die quietly. Without this, an exception escaping the
+    # consumer loop leaves a process that looks healthy - the scheduler still
+    # logging, the port still open - while nothing is being consumed at all.
+    def _task_died(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.critical(
+                "worker task exited unexpectedly; shutting down",
+                extra={"task": task.get_name()},
+                exc_info=exc,
+            )
+        else:
+            logger.error("worker task exited early", extra={"task": task.get_name()})
+        worker._stop.set()
+
+    consumer_task.add_done_callback(_task_died)
+    scheduler_task.add_done_callback(_task_died)
 
     try:
         await worker._stop.wait()

@@ -1,0 +1,16 @@
+.git
+.venv
+node_modules
+videos/
+certs/
+frontend/dist
+frontend/node_modules
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.vscode
+.idea
+*.tar.gz
+*.log

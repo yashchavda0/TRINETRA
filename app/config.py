@@ -7,7 +7,9 @@ into the repository.
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -68,6 +70,19 @@ class Settings(BaseSettings):
     # spatial ceiling because the GIS console loads the whole visible fleet once.
     max_list_results: int = Field(default=10_000, ge=1, le=100_000)
 
+    # --- Authentication ---------------------------------------------------
+    # MUST be overridden in any deployment. The default exists so a fresh clone
+    # starts, and startup logs a warning when it is still in use - a shared
+    # signing key means anyone with the source can mint an admin token.
+    jwt_secret: str = "trinetra-development-secret-change-me"
+    jwt_algorithm: str = "HS256"
+    access_token_ttl_minutes: int = Field(default=60, ge=1, le=1440)
+    refresh_token_ttl_days: int = Field(default=7, ge=1, le=90)
+    # Allows the first administrator to be created on an empty users table.
+    # Automatically inert once any user exists.
+    bootstrap_admin_email: str | None = None
+    bootstrap_admin_password: str | None = None
+
     # --- Analytics bus (Kafka) -------------------------------------------
     # Topic and bootstrap must match cmd/ingestion_gateway, which publishes raw
     # SurveillanceEvent bytes keyed by the numeric DepartmentCode tag.
@@ -90,6 +105,14 @@ class Settings(BaseSettings):
     target_ttl_seconds: float = Field(default=300.0, gt=0)
     scheduler_interval_seconds: float = Field(default=1.0, gt=0)
     graph_reload_seconds: float = Field(default=300.0, gt=0)
+    # Far shorter than the graph reload: adding a stolen vehicle to the
+    # watchlist must take effect in seconds, not at the next graph cycle.
+    watchlist_reload_seconds: float = Field(default=15.0, gt=0)
+    # Cooldown per (plate, camera) before the external registries are queried
+    # again. A vehicle dwelling in view yields a plate on every sampled frame,
+    # and each screening costs two outbound calls to eGujCop and VAHAN.
+    # Watchlist matching is deliberately NOT rate-limited by this.
+    plate_screen_ttl_seconds: float = Field(default=60.0, gt=0)
 
     # --- External state registries (adapters/) ---------------------------
     # Leaving a base URL empty puts that adapter in deterministic simulation
@@ -122,6 +145,26 @@ class Settings(BaseSettings):
     # before it can answer. Reusing the control-API timeout here makes a slow
     # but working camera fail as though it were broken.
     mediamtx_source_start_timeout_seconds: float = Field(default=20.0, gt=0)
+
+    # --- External live-feed grid (evaluation) -----------------------------
+    # The grid splits its access model across two hosts: a CDN serves the
+    # catalogue and HLS on any network, while RTSP and WebRTC are served
+    # directly on a public static IP because a CDN cannot proxy them. Both are
+    # placeholders for the current test grid - every value is replaceable here
+    # and nothing else in the tree hardcodes a grid host, port or camera id.
+    live_grid_catalogue_url: str | None = None
+    live_grid_hls_base_url: str | None = None
+    live_grid_media_host: str | None = None
+    live_grid_rtsp_port: int = Field(default=8554, gt=0, le=65535)
+    # Registered email + access password. The grid authenticates every RTSP and
+    # WebRTC connection with these embedded in the URL, and only approved
+    # emails may connect. They are deliberately NOT stored in the registry:
+    # streams.py injects them when MediaMTX is told to dial the camera, so the
+    # password never reaches Postgres and never leaves through the camera API.
+    live_grid_email: str | None = None
+    live_grid_password: str | None = None
+    # Fallback camera ids, used only when the catalogue cannot be read.
+    live_grid_camera_ids: str | None = None
 
     # --- Stream relay (cmd/stream_relay) ---------------------------------
     # Empty means "relay not deployed": the WebRTC proxy then returns 503 and
@@ -202,6 +245,61 @@ class Settings(BaseSettings):
         if self.relay_configured:
             return "relay"
         return "none"
+
+    @property
+    def live_grid_credentials(self) -> tuple[str, str] | None:
+        """The grid's (email, password), or None when either is unset.
+
+        Both halves are required: the grid rejects a connection carrying only
+        one, so a half-configured pair is the same as no pair at all.
+        """
+        if self.live_grid_email and self.live_grid_password:
+            return (self.live_grid_email, self.live_grid_password)
+        return None
+
+    @property
+    def live_grid_media_hosts(self) -> frozenset[str]:
+        """Lowercased hostnames that may receive the grid credentials.
+
+        This is an allowlist, not a convenience: without it a camera row
+        pointing anywhere at all would have our grid password appended to its
+        URL the first time someone asked to view it.
+        """
+        hosts: set[str] = set()
+        if self.live_grid_media_host:
+            # Tolerate a host:port value, and an accidental scheme prefix.
+            raw = self.live_grid_media_host.split("//")[-1]
+            host = raw.split("/")[0].rsplit(":", 1)[0] if raw.count(":") == 1 else raw.split("/")[0]
+            if host:
+                hosts.add(host.lower())
+        if self.live_grid_hls_base_url:
+            parsed = urlparse(self.live_grid_hls_base_url)
+            if parsed.hostname:
+                hosts.add(parsed.hostname.lower())
+        return frozenset(hosts)
+
+    @property
+    def live_grid_camera_id_list(self) -> list[str]:
+        """LIVE_GRID_CAMERA_IDS expanded into ids.
+
+        Accepts a comma-separated list, or a `cam01-cam30`-style range whose
+        two ends share a prefix and a zero-padded width. Returns [] when unset.
+        """
+        raw = (self.live_grid_camera_ids or "").strip()
+        if not raw:
+            return []
+        if "," in raw:
+            return [item.strip() for item in raw.split(",") if item.strip()]
+
+        match = re.fullmatch(r"(?P<prefix>.*?)(?P<start>\d+)\s*-\s*(?P=prefix)(?P<end>\d+)", raw)
+        if not match:
+            return [raw]
+        start, end = match.group("start"), match.group("end")
+        width = len(start)
+        return [
+            f"{match.group('prefix')}{value:0{width}d}"
+            for value in range(int(start), int(end) + 1)
+        ]
 
     @property
     def relay_client_cert(self) -> tuple[str, str] | None:

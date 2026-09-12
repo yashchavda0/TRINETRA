@@ -33,19 +33,31 @@ import asyncio
 import logging
 import uuid
 from typing import Annotated, Final
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import asyncpg
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.auth.dependencies import require_role
 from app.config import Settings, get_settings
 from app.database import get_connection, get_pool
-from app.schemas import WebRTCAnswerResponse, WebRTCOfferRequest
+from app.schemas import StreamStateResponse, WebRTCAnswerResponse, WebRTCOfferRequest
 
 logger: Final = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v2", tags=["streams"])
+# Authentication is applied at the router, not per route, so a new streaming
+# endpoint is protected by default. Until this was added the registry was locked
+# while the video plane beside it was open: anyone who could reach the port
+# could open a live stream for any camera, and the camera's stream_url - which
+# frequently carries credentials - is resolved server-side for whoever asks.
+# VIEWER is the floor deliberately: watching is the least privileged thing an
+# authenticated operator does.
+router = APIRouter(
+    prefix="/api/v2",
+    tags=["streams"],
+    dependencies=[Depends(require_role("VIEWER"))],
+)
 
 # Module-level clients so TLS handshakes and connection setup are amortised
 # across requests rather than repeated per offer.
@@ -136,15 +148,59 @@ def _is_mediamtx_source(stream_url: str, settings: Settings) -> bool:
     return host_matches and str(port) == (configured_port or "8554")
 
 
+def _with_grid_credentials(stream_url: str, settings: Settings) -> str:
+    """Return `stream_url` with the live grid's credentials attached, in memory.
+
+    The grid authenticates every RTSP and WebRTC connection with a registered
+    email and access password embedded in the URL, so they have to be present
+    when MediaMTX dials the camera. They must not be present anywhere else:
+    registry rows for grid cameras are stored without credentials, which is
+    what keeps the password out of Postgres and out of every response from
+    GET /api/v1/cameras. This function is that seam, and the returned value
+    never leaves the process except towards the media server.
+
+    The credentials are only ever attached to a host on the configured grid
+    allowlist. Appending them to whatever URL a camera row happens to hold
+    would hand our password to any third-party endpoint someone registered.
+    """
+    credentials = settings.live_grid_credentials
+    if credentials is None:
+        return stream_url
+
+    parsed = urlparse(stream_url)
+    if not parsed.hostname or parsed.hostname.lower() not in settings.live_grid_media_hosts:
+        return stream_url
+    # An explicit userinfo in the row wins: it is an operator's deliberate
+    # override, possibly for a camera with its own account.
+    if parsed.username or parsed.password:
+        return stream_url
+
+    email, password = credentials
+    # quote() is what turns the email's @ into %40, as the grid requires, and
+    # it also survives a password containing : / @ or #.
+    userinfo = f"{quote(email, safe='')}:{quote(password, safe='')}"
+    netloc = f"{userinfo}@{parsed.netloc}"
+    # MediaMTX keeps this source string in its own path config, so it is
+    # visible on the control API - which is loopback-bound and already grants
+    # full control to anyone who reaches it, so this adds no new exposure.
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
 def _rtsp_endpoint(stream_url: str) -> str:
     """`rtsp://host:port` with credentials and path stripped, for error text.
 
     Never echo the full stream_url to a client: it carries camera credentials.
     """
     parsed = urlparse(stream_url)
+    scheme = parsed.scheme or "rtsp"
     host = parsed.hostname or "?"
-    port = parsed.port or 554
-    return f"{parsed.scheme or 'rtsp'}://{host}:{port}"
+    if parsed.port:
+        return f"{scheme}://{host}:{parsed.port}"
+    # A camera can now be registered by its HLS URL, which normally carries no
+    # port. Naming RTSP's 554 there would send the reader hunting for a port
+    # that was never in play.
+    port = 554 if scheme in {"rtsp", "rtsps"} else None
+    return f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
 
 
 def _media_unreachable(settings: Settings, exc: Exception) -> HTTPException:
@@ -484,7 +540,7 @@ async def webrtc_offer(
             detail=f"camera '{payload.camera_id}' is {record['status']}, not ACTIVE",
         )
 
-    stream_url = record["stream_url"]
+    stream_url = _with_grid_credentials(record["stream_url"], settings)
     if backend == "mediamtx":
         sdp_answer, session_id, resource = await _negotiate_via_mediamtx(
             payload, stream_url, settings
@@ -518,6 +574,65 @@ async def webrtc_offer(
     )
     return WebRTCAnswerResponse(
         sdp=sdp_answer, session_id=session_id, camera_id=payload.camera_id
+    )
+
+
+@router.get(
+    "/streams/{camera_id}/state",
+    response_model=StreamStateResponse,
+    summary="What the media server currently holds for a camera",
+)
+async def stream_state(
+    camera_id: uuid.UUID,
+    connection: Annotated[asyncpg.Connection, Depends(get_connection)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> StreamStateResponse:
+    """Report MediaMTX's view of this camera's path, codecs included.
+
+    This exists because the answer SDP does not say what is actually arriving.
+    A camera publishing H.265 negotiates cleanly, delivers bytes, and shows a
+    black tile in Chrome - which looks exactly like a dead camera. Asking the
+    media server what tracks it sees turns that into a sentence the operator
+    can act on.
+
+    A path that does not exist yet is not an error: `sourceOnDemand` means the
+    path is created on the first viewer, so `ready: false` is the normal answer
+    before anyone has watched.
+    """
+    exists = await connection.fetchval("SELECT 1 FROM cameras WHERE id = $1", camera_id)
+    if exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"camera '{camera_id}' is not registered",
+        )
+
+    path_name = f"cam-{camera_id}"
+    empty = StreamStateResponse(camera_id=camera_id, path=path_name, ready=False)
+
+    api_base = (settings.mediamtx_api_base_url or "").rstrip("/")
+    if not api_base:
+        # No MediaMTX configured at all: report "nothing ready" rather than
+        # failing, so the console can still show its own WebRTC statistics.
+        return empty
+
+    client = await _get_media_client(settings)
+    try:
+        response = await client.get(
+            f"{api_base}/v3/paths/get/{path_name}",
+            timeout=httpx.Timeout(settings.mediamtx_request_timeout_seconds),
+        )
+        if response.status_code != status.HTTP_200_OK:
+            return empty
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        raise _media_unreachable(settings, RuntimeError("path state unavailable")) from None
+
+    return StreamStateResponse(
+        camera_id=camera_id,
+        path=path_name,
+        ready=bool(body.get("ready")),
+        tracks=[str(track) for track in (body.get("tracks") or [])],
+        ready_time=body.get("readyTime"),
     )
 
 

@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from app import database
 from app.config import get_settings
-from app.routers import alerts, cameras, streams
+from app.routers import alerts, audit, auth, cameras, registry_io, reports, streams
 from app.schemas import HealthResponse
 
 # Correlation id for the request currently being served, readable by every log
@@ -109,6 +109,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         },
     )
 
+    # A shared signing key means anyone holding the source can mint an admin
+    # token, so this must be loud rather than a comment nobody reads.
+    if settings.jwt_secret == "trinetra-development-secret-change-me":
+        logger.warning(
+            "JWT_SECRET is still the built-in development value - set a unique "
+            "secret before this service is reachable by anyone else"
+        )
+
     # Deliberately not guarded: an unreachable database must abort startup
     # rather than let the service accept traffic it cannot serve.
     await database.connect(settings)
@@ -141,7 +149,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    # PATCH and DELETE are required: without them the browser's preflight fails
+    # and the console's only camera-edit and decommission paths are unreachable.
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["X-Request-ID"],
 )
@@ -260,7 +270,15 @@ async def runtime_exception_handler(request: Request, exc: RuntimeError) -> JSON
     )
 
 
+app.include_router(auth.router)
+app.include_router(auth.admin_router)
+# registry_io before cameras: its literal paths (/bulk, /export.csv,
+# /import-template.csv) share the /api/v1/cameras prefix, and the camera
+# router's UUID-constrained routes must not be given the chance to claim them.
+app.include_router(registry_io.router)
 app.include_router(cameras.router)
+app.include_router(reports.router)
+app.include_router(audit.router)
 app.include_router(streams.router)
 app.include_router(alerts.router)
 app.include_router(alerts.ws_router)
