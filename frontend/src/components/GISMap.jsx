@@ -319,6 +319,17 @@ export default function GISMap({
 
         source.clear();
         source.addFeatures(features);
+
+        if (features.length > 0 && mapRef.current) {
+          const extent = source.getExtent();
+          if (extent && Number.isFinite(extent[0])) {
+            mapRef.current.getView().fit(extent, {
+              padding: [80, 80, 80, 80],
+              maxZoom: 12,
+              duration: 500,
+            });
+          }
+        }
       } catch (error) {
         if (error.name !== 'AbortError') {
           console.error('Camera registry load failed', error);
@@ -371,8 +382,11 @@ export default function GISMap({
     const connect = () => {
       if (disposed) return;
       let socket;
+      const wsUrl = alertsWsUrl.startsWith('ws://') || alertsWsUrl.startsWith('wss://')
+        ? alertsWsUrl
+        : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}${alertsWsUrl.startsWith('/') ? alertsWsUrl : '/' + alertsWsUrl}`;
       try {
-        socket = new WebSocket(alertsWsUrl);
+        socket = new WebSocket(wsUrl);
       } catch (error) {
         console.error('Alert socket construction failed', error);
         scheduleReconnect();

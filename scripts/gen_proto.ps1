@@ -28,7 +28,13 @@ if (-not (Test-Path $protoFile)) {
     throw "contract not found: $protoFile"
 }
 
-python -c "import grpc_tools" *> $null
+$pythonExe = "python"
+$venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    $pythonExe = $venvPython
+}
+
+& $pythonExe -c "import grpc_tools" *> $null
 if ($LASTEXITCODE -ne 0) {
     throw "grpcio-tools is not installed. Run: pip install -r requirements.txt"
 }
@@ -39,7 +45,7 @@ if (-not (Test-Path $outPath)) {
 }
 
 Write-Host "Generating Python bindings into $OutputDir ..." -ForegroundColor Cyan
-python -m grpc_tools.protoc -I proto --python_out=$OutputDir proto/surveillance_event.proto
+& $pythonExe -m grpc_tools.protoc -I proto --python_out=$OutputDir proto/surveillance_event.proto
 if ($LASTEXITCODE -ne 0) {
     throw "protoc failed"
 }
@@ -52,7 +58,7 @@ if (-not (Test-Path $generated)) {
 # Round-trip the contract so a dimension or enum mistake surfaces here rather
 # than inside the worker's consume loop.
 Write-Host "Verifying the generated bindings..." -ForegroundColor Cyan
-python -c @"
+& $pythonExe -c @"
 import sys, uuid
 sys.path.insert(0, r'$repoRoot')
 from generated import surveillance_event_pb2 as pb

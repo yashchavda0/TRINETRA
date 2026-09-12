@@ -44,3 +44,6 @@ frontend/.vite/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Local scratch scripts
+scratch/

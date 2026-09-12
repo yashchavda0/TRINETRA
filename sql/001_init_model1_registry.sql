@@ -13,14 +13,14 @@
 -- rolls back completely. Every statement is idempotent, so re-running is safe.
 -- ============================================================================
 
-BEGIN;
-
 -- ---------------------------------------------------------------------------
 -- Extensions
 -- ---------------------------------------------------------------------------
 -- PostGIS supplies GEOMETRY/GEOGRAPHY types, the GIST spatial index operator
 -- classes, and ST_* functions.
 CREATE EXTENSION IF NOT EXISTS postgis;
+
+BEGIN;
 
 -- gen_random_uuid() is part of core PostgreSQL from version 13 onward, so no
 -- pgcrypto extension is required on PostgreSQL 16.
