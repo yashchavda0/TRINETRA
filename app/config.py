@@ -129,6 +129,11 @@ class Settings(BaseSettings):
     p0_alert_ws_url: str = "ws://127.0.0.1:8000/alerts/p0"
     p0_alert_api_key: str | None = None
     alert_publish_url: str = "http://127.0.0.1:8000/api/v1/alerts/publish"
+    # Live detection fan-out (Vehicle Search). Reuses the P0 alert channel key:
+    # both a producer pushing a just-persisted row and a console watching it
+    # sit on the same trust boundary, so a second shared secret would add an
+    # operational variable without adding security.
+    detection_publish_url: str = "http://127.0.0.1:8000/api/v1/detections/publish"
 
     # --- Media plane (MediaMTX) ------------------------------------------
     # MediaMTX carries the actual video: RTSP in, WebRTC out. The API proxies
@@ -165,6 +170,49 @@ class Settings(BaseSettings):
     live_grid_password: str | None = None
     # Fallback camera ids, used only when the catalogue cannot be read.
     live_grid_camera_ids: str | None = None
+
+    # --- ANPR service (services/anpr) ------------------------------------
+    # Public ONNX checkpoints, pulled and cached on first load. Benchmarked on
+    # the development machine (i5-8350U, 4 cores, no GPU): detector 33 ms on a
+    # 1080p frame, OCR 4 ms per crop, motion gate 0.3 ms.
+    anpr_detector_model: str = "yolo-v9-t-384-license-plate-end2end"
+    anpr_ocr_model: str = "cct-xs-v2-global-model"
+    # Grabber slots: one below the core count, so inference always has a core.
+    # Also the ceiling on concurrent RTSP connections the service opens.
+    anpr_grabbers: int = Field(default=3, ge=1, le=32)
+    # A dwell amortises the RTSP handshake and keyframe wait over several
+    # frames. One-shot grabs spend more time connecting than inferring.
+    anpr_dwell_seconds: float = Field(default=4.0, gt=0)
+    anpr_dwell_fps: float = Field(default=2.0, gt=0)
+    anpr_grab_timeout_seconds: float = Field(default=15.0, gt=0)
+    # Revisit interval per camera. Cameras sited for plate capture get the fast
+    # one; the rest are sampled rarely because most will never yield a plate.
+    anpr_fast_interval_seconds: float = Field(default=10.0, gt=0)
+    anpr_slow_interval_seconds: float = Field(default=120.0, gt=0)
+    # Exponential backoff ceiling for a camera that yields no frames at all.
+    anpr_max_backoff_seconds: float = Field(default=900.0, gt=0)
+    anpr_camera_reload_seconds: float = Field(default=120.0, gt=0)
+    anpr_report_seconds: float = Field(default=60.0, gt=0)
+    # Bounded queue between grabbers and inference. This is the backpressure:
+    # when it fills, grabbers drop frames and count them, so the service
+    # samples less rather than silently falling further behind.
+    anpr_queue_size: int = Field(default=24, ge=1)
+    # Decode size. 720p keeps plates legible at typical junction framing while
+    # costing roughly half of 1080p to decode and pipe.
+    anpr_frame_width: int = Field(default=1280, ge=320)
+    anpr_frame_height: int = Field(default=720, ge=180)
+    # Fraction of pixels that must change before a frame is worth inferring.
+    anpr_motion_threshold: float = Field(default=0.002, ge=0.0, le=1.0)
+    # Detector confidence floor for OCR, and the higher floor for publishing.
+    # A guess on the bus becomes a permanent detections row and can raise a
+    # false P0, so publishing is held to a stricter bar than looking.
+    anpr_min_detection_confidence: float = Field(default=0.4, ge=0.0, le=1.0)
+    anpr_min_publish_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    # Same plate at the same camera inside this window publishes once. Without
+    # it one vehicle crossing one junction puts thirty events on the bus.
+    anpr_dedup_seconds: float = Field(default=30.0, gt=0)
+    anpr_save_snapshots: bool = True
+    anpr_snapshot_dir: str = "data/anpr_snapshots"
 
     # --- Stream relay (cmd/stream_relay) ---------------------------------
     # Empty means "relay not deployed": the WebRTC proxy then returns 503 and

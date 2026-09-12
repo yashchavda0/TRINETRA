@@ -25,7 +25,17 @@ from pydantic import ValidationError
 
 from app import database
 from app.config import get_settings
-from app.routers import alerts, audit, auth, cameras, registry_io, reports, streams
+from app.routers import (
+    alerts,
+    audit,
+    auth,
+    cameras,
+    detections,
+    registry_io,
+    reports,
+    streams,
+    watchlist,
+)
 from app.schemas import HealthResponse
 
 # Correlation id for the request currently being served, readable by every log
@@ -279,6 +289,9 @@ app.include_router(registry_io.router)
 app.include_router(cameras.router)
 app.include_router(reports.router)
 app.include_router(audit.router)
+app.include_router(detections.router)
+app.include_router(detections.ws_router)
+app.include_router(watchlist.router)
 app.include_router(streams.router)
 app.include_router(alerts.router)
 app.include_router(alerts.ws_router)

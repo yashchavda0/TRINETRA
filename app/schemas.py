@@ -8,6 +8,7 @@ happens exactly once, in :mod:`app.routers.cameras`.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from ipaddress import ip_address
 from typing import Annotated, Literal
@@ -592,6 +593,267 @@ class BulkImportResult(BaseModel):
     skipped_existing: int = Field(ge=0)
     failed_rows: list[BulkRowError] = Field(default_factory=list)
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Detections and vehicle movement (Model 2)
+# ---------------------------------------------------------------------------
+
+
+class DetectionRead(BaseModel):
+    """One observation off the analytics bus.
+
+    A detection may carry a plate, a Re-ID identity, both, or neither: an ANPR
+    reader publishes a plate with no embedding, and an edge tracker publishes an
+    embedding with no plate. Both are real observations.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    event_id: UUID
+    camera_id: UUID
+    global_camera_code: str | None = None
+    site_name: str | None = None
+    department_id: str | None = None
+    timestamp_utc_ms: int
+    object_class: str
+    plate_number: str | None = None
+    plate_confidence: float | None = None
+    track_id: str | None = None
+    target_id: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    embedding_accepted: bool
+    snapshot_uri: str | None = None
+    attributes: dict[str, object] = Field(default_factory=dict)
+
+
+class DetectionListResponse(BaseModel):
+    items: list[DetectionRead]
+    total: int = Field(ge=0)
+    limit: int
+    offset: int
+
+
+class DetectionPublishRequest(BaseModel):
+    """One detection pushed in by a producer (ANPR service, worker) for live fan-out.
+
+    The row itself is already committed by the time this arrives - persistence
+    and broadcast are deliberately separate steps, same as alerts, so a console
+    that misses the socket frame can still recover the detection from
+    ``GET /api/v1/detections``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    event_id: UUID
+    camera_id: UUID
+    global_camera_code: str | None = None
+    site_name: str | None = None
+    department_id: str | None = None
+    timestamp_utc_ms: int = Field(gt=0)
+    object_class: str = "AUTOMOBILE"
+    plate_number: str | None = Field(default=None, max_length=24)
+    plate_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    track_id: str | None = None
+    target_id: str | None = None
+    latitude: Latitude | None = None
+    longitude: Longitude | None = None
+    snapshot_uri: str | None = None
+
+    @model_validator(mode="after")
+    def _require_full_position(self) -> "DetectionPublishRequest":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be supplied together")
+        return self
+
+
+class DetectionPublishResult(BaseModel):
+    event_id: UUID
+    subscribers_notified: int = Field(ge=0)
+
+
+class MovementHop(BaseModel):
+    """One camera-to-camera leg of a vehicle's journey."""
+
+    from_camera_id: UUID
+    from_camera_code: str | None = None
+    to_camera_id: UUID
+    to_camera_code: str | None = None
+    departed_utc_ms: int
+    arrived_utc_ms: int
+    transit_seconds: float = Field(ge=0)
+    distance_meters: float | None = Field(
+        default=None, description="Straight-line distance; road distance will be longer"
+    )
+    implied_speed_kmh: float | None = None
+
+
+class MovementHistory(BaseModel):
+    """Every sighting of one plate, in order, with the legs between them."""
+
+    plate_number: str
+    sighting_count: int = Field(ge=0)
+    first_seen_utc_ms: int | None = None
+    last_seen_utc_ms: int | None = None
+    distinct_cameras: int = Field(ge=0)
+    sightings: list[DetectionRead] = Field(default_factory=list)
+    hops: list[MovementHop] = Field(default_factory=list)
+    caveat: str = Field(
+        default=(
+            "Sightings are ANPR reads, not a tracked path. A gap between two "
+            "cameras means no registered camera read the plate, not that the "
+            "vehicle travelled directly between them. Distances are "
+            "straight-line and speeds derived from them are lower bounds."
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Watchlist (Model 2)
+# ---------------------------------------------------------------------------
+
+WatchlistPriority = Literal["P0", "P1", "P2", "P3"]
+
+
+class WatchlistCreate(BaseModel):
+    """A vehicle or Re-ID identity of interest."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    plate_number: str | None = Field(default=None, max_length=24)
+    target_id: str | None = Field(default=None, max_length=64)
+    classification: str = Field(default="PERSON_OF_INTEREST", max_length=32)
+    priority: WatchlistPriority = "P1"
+    reason: str = Field(min_length=1, max_length=500)
+    case_reference: str | None = Field(default=None, max_length=120)
+    expires_at: datetime | None = None
+
+    @field_validator("plate_number")
+    @classmethod
+    def _normalise(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        # Stored in the same normalised form the worker compares against, so a
+        # hand-typed "GJ 01 AB 1234" matches a reader emitting "GJ01AB1234".
+        cleaned = re.sub(r"[\s\-.]", "", value).upper()
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def _must_identify_something(self) -> "WatchlistCreate":
+        # Mirrors the table's CHECK: an entry matching nothing can never fire.
+        if not self.plate_number and not self.target_id:
+            raise ValueError("supply a plate_number, a target_id, or both")
+        return self
+
+
+class WatchlistUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    classification: str | None = Field(default=None, max_length=32)
+    priority: WatchlistPriority | None = None
+    reason: str | None = Field(default=None, min_length=1, max_length=500)
+    case_reference: str | None = Field(default=None, max_length=120)
+    is_active: bool | None = None
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _require_something_to_do(self) -> "WatchlistUpdate":
+        if not self.model_fields_set:
+            raise ValueError("no fields to update")
+        return self
+
+
+class WatchlistRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    plate_number: str | None
+    target_id: str | None
+    classification: str
+    priority: str
+    reason: str
+    case_reference: str | None
+    department_id: str | None
+    added_by: UUID | None = None
+    is_active: bool
+    expires_at: datetime | None = None
+    created_at: datetime
+
+
+class WatchlistListResponse(BaseModel):
+    items: list[WatchlistRead]
+    total: int = Field(ge=0)
+
+
+# ---------------------------------------------------------------------------
+# Alert history and workflow (Model 2)
+# ---------------------------------------------------------------------------
+
+AlertWorkflowState = Literal[
+    "NEW", "ACKNOWLEDGED", "IN_PROGRESS", "RESOLVED", "FALSE_POSITIVE"
+]
+
+
+class AlertRead(BaseModel):
+    """A recorded threat alert.
+
+    ``subject`` carries identity data sourced from an audited CCTNS lookup and
+    is returned only to DEPT_ADMIN and above; for everyone else it is empty.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    alert_id: str
+    priority: str
+    classification: str
+    plate_number: str | None = None
+    camera_id: UUID | None = None
+    global_camera_code: str | None = None
+    site_name: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    detected_at_utc_ms: int
+    dispatched_at_utc_ms: int
+    confidence: float
+    vehicle: dict[str, object] = Field(default_factory=dict)
+    subject: dict[str, object] = Field(default_factory=dict)
+    evidence: dict[str, object] = Field(default_factory=dict)
+    workflow_state: str = "NEW"
+    acknowledged_by: UUID | None = None
+    acknowledged_at: datetime | None = None
+    assigned_to: UUID | None = None
+    resolution_note: str | None = None
+    received_at: datetime
+
+
+class AlertListResponse(BaseModel):
+    items: list[AlertRead]
+    total: int = Field(ge=0)
+    limit: int
+    offset: int
+
+
+class AlertWorkflowUpdate(BaseModel):
+    """Acknowledge, assign or resolve an alert."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    workflow_state: AlertWorkflowState | None = None
+    assigned_to: UUID | None = None
+    resolution_note: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _require_something_to_do(self) -> "AlertWorkflowUpdate":
+        if not self.model_fields_set:
+            raise ValueError("no fields to update")
+        # Closing an alert without saying why leaves the next operator guessing
+        # whether it was handled or dismissed.
+        if self.workflow_state in {"RESOLVED", "FALSE_POSITIVE"} and not self.resolution_note:
+            raise ValueError(
+                f"a resolution_note is required when setting {self.workflow_state}"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------

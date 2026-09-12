@@ -661,6 +661,11 @@ class HandoffWorker:
         await self._persist_detection(event, target_id, embedding_ok)
         self.processed += 1
 
+        # Fire-and-forget to the live console feed. Persistence above is the
+        # durable fact; this is only the notification, so a dead API here must
+        # never fail the message that already committed.
+        await self._publish_detection(event, target_id)
+
         # Re-identification state only means something when there is an identity.
         if target_id is not None:
             await self._advance_states(event, target_id)
@@ -858,6 +863,40 @@ class HandoffWorker:
                 event.plate_number,
                 event.plate_confidence,
                 event.snapshot_uri,
+            )
+
+    async def _publish_detection(self, event: DecodedEvent, target_id: str | None) -> None:
+        """Notify the API's live feed. Best-effort: never raises past this call."""
+        if self._publisher is None:
+            return
+
+        frame: dict[str, Any] = {
+            "event_id": event.event_id,
+            "camera_id": event.camera_id,
+            "department_id": event.department_id,
+            "timestamp_utc_ms": event.timestamp_utc_ms,
+            "object_class": event.object_class,
+            "plate_number": event.plate_number,
+            "plate_confidence": event.plate_confidence,
+            "track_id": event.track_id,
+            "target_id": target_id,
+            "latitude": event.latitude,
+            "longitude": event.longitude,
+            "snapshot_uri": event.snapshot_uri,
+        }
+        try:
+            response = await self._publisher.post(
+                self.settings.detection_publish_url, json=frame
+            )
+            if response.status_code >= 400:
+                logger.warning(
+                    "detection publish rejected",
+                    extra={"event_id": event.event_id, "status": response.status_code},
+                )
+        except httpx.HTTPError as exc:
+            logger.error(
+                "detection publish failed",
+                extra={"event_id": event.event_id, "error": str(exc)},
             )
 
     # -- plate handling ----------------------------------------------------

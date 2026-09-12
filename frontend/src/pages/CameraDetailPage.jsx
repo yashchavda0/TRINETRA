@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, History, Pencil, Save, Trash2, X } from 'lucide-react';
+import { ArrowLeft, Camera, History, Pencil, Save, ShieldAlert, Trash2, X } from 'lucide-react';
 
 import { PageHeader } from '../components/layout/AppShell.jsx';
 import {
@@ -10,6 +10,7 @@ import {
   Card,
   CardBody,
   CardHeader,
+  EmptyState,
   ErrorState,
   Field,
   Input,
@@ -21,8 +22,86 @@ import {
   Th,
   Textarea,
 } from '../components/ui/index.jsx';
+import FlagSuspiciousDialog from '../components/FlagSuspiciousDialog.jsx';
 import { api } from '../lib/api.js';
 import { useAuth } from '../lib/auth.jsx';
+
+function formatTime(ms) {
+  return new Date(ms).toLocaleString();
+}
+
+/**
+ * Recent plate reads at this camera, so an operator who noticed something on
+ * the video tile - not from a plate list - can still find what ANPR already
+ * captured around that time and flag it, without knowing the plate in advance.
+ */
+function RecentPlateReads({ cameraId, onFlag }) {
+  const reads = useQuery({
+    queryKey: ['detections', 'by-camera', cameraId],
+    queryFn: () => api.get('/api/v1/detections', { camera_id: cameraId, plates_only: true, limit: 20 }),
+    refetchInterval: 15_000,
+  });
+
+  return (
+    <Card>
+      <CardHeader
+        title="Recent plate reads"
+        description="Newest first — refreshes automatically"
+      />
+      {reads.isLoading ? (
+        <CardBody>
+          <Spinner />
+        </CardBody>
+      ) : reads.isError ? (
+        <CardBody>
+          <ErrorState error={reads.error} onRetry={reads.refetch} />
+        </CardBody>
+      ) : reads.data?.items?.length ? (
+        <Table>
+          <thead>
+            <tr>
+              <Th>Plate</Th>
+              <Th>Confidence</Th>
+              <Th>Seen</Th>
+              <Th className="text-right">Actions</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {reads.data.items.map((item) => (
+              <tr key={item.event_id}>
+                <Td className="font-mono text-xs text-accent">{item.plate_number}</Td>
+                <Td className="text-xs tabular-nums">
+                  {item.plate_confidence != null ? `${Math.round(item.plate_confidence * 100)}%` : '—'}
+                </Td>
+                <Td className="whitespace-nowrap text-xs text-slate-400">
+                  {formatTime(item.timestamp_utc_ms)}
+                </Td>
+                <Td className="text-right">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    title="Flag as suspicious"
+                    onClick={() => onFlag(item.plate_number)}
+                  >
+                    <ShieldAlert className="h-3.5 w-3.5" />
+                  </Button>
+                </Td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      ) : (
+        <CardBody>
+          <EmptyState
+            icon={Camera}
+            title="No plate reads yet"
+            description="ANPR reads from this camera appear here within seconds of being published."
+          />
+        </CardBody>
+      )}
+    </Card>
+  );
+}
 
 const CAMERA_TYPES = ['FIXED', 'PTZ', 'DOME', 'BULLET', 'ANPR', 'THERMAL', 'PANORAMIC', 'OTHER'];
 const STATUSES = ['ACTIVE', 'INACTIVE', 'MAINTENANCE', 'DECOMMISSIONED'];
@@ -54,6 +133,7 @@ export default function CameraDetailPage() {
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({});
   const [saveError, setSaveError] = useState(null);
+  const [flagPlate, setFlagPlate] = useState(null);
 
   const camera = useQuery({
     queryKey: ['camera', cameraId],
@@ -363,6 +443,8 @@ export default function CameraDetailPage() {
             </div>
           )}
 
+          <RecentPlateReads cameraId={data.id} onFlag={setFlagPlate} />
+
           {atLeast('DEPT_ADMIN') && (
             <Card>
               <CardHeader
@@ -485,6 +567,8 @@ export default function CameraDetailPage() {
           )}
         </div>
       </div>
+
+      {flagPlate && <FlagSuspiciousDialog plate={flagPlate} onClose={() => setFlagPlate(null)} />}
     </div>
   );
 }

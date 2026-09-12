@@ -501,6 +501,13 @@ async def list_cameras(
     connectivity: Annotated[str | None, Query(max_length=20)] = None,
     maintenance: Annotated[str | None, Query(max_length=20)] = None,
     ward: Annotated[str | None, Query(max_length=120)] = None,
+    vms_vendor: Annotated[
+        str | None,
+        Query(
+            max_length=64,
+            description="Owning VMS, e.g. LIVE-GRID. Case-insensitive exact match",
+        ),
+    ] = None,
     sort_by: Annotated[str, Query()] = "global_camera_code",
     order: Annotated[str, Query(pattern="^(asc|desc)$")] = "asc",
 ) -> CameraListResponse:
@@ -526,6 +533,15 @@ async def list_cameras(
     if ward:
         params.append(ward)
         predicates.append(f"ward = ${len(params)}")
+
+    if vms_vendor:
+        # Not folded into the uppercasing loop above: vendor names are recorded
+        # as written ("Milestone", "LIVE-GRID"), so an upper() comparison would
+        # silently match nothing. The video wall filters on this to show only
+        # cameras that can actually stream, and a filter that pages correctly
+        # has to be applied here rather than over one page of results.
+        params.append(vms_vendor)
+        predicates.append(f"vms_vendor ILIKE ${len(params)}")
 
     if q:
         # One placeholder reused across the OR arms; the trigram indexes from

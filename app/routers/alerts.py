@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 from typing import Annotated, Any, Final
+from uuid import UUID
 
 import asyncpg
 from fastapi import (
@@ -33,9 +35,16 @@ from fastapi import (
     status,
 )
 
+from app.auth.dependencies import Principal, get_current_principal, require_role
 from app.config import Settings, get_settings
 from app.database import get_connection
-from app.schemas import AlertPublishRequest, AlertPublishResult
+from app.schemas import (
+    AlertListResponse,
+    AlertPublishRequest,
+    AlertPublishResult,
+    AlertRead,
+    AlertWorkflowUpdate,
+)
 
 logger: Final = logging.getLogger(__name__)
 
@@ -76,12 +85,21 @@ def _authorise(
 ) -> None:
     """Reject the caller unless it presents the configured alert channel key.
 
-    With no key configured the channel is open — acceptable for a local
-    development stack, and the reason `.env.example` sets one.
+    An unconfigured key closes the channel rather than opening it. The previous
+    behaviour - return early, allow everything - meant that forgetting one
+    environment variable silently published the P0 feed, and that feed carries
+    `subject` data the schema flags as identity information from an audited
+    CCTNS lookup. A missing secret must fail shut.
     """
     expected = settings.p0_alert_api_key
     if not expected:
-        return
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "the alert channel has no key configured; set P0_ALERT_API_KEY "
+                "and restart the API"
+            ),
+        )
 
     presented = api_key_header or token
     if not presented and authorization:
@@ -89,7 +107,10 @@ def _authorise(
         if scheme.lower() == "bearer":
             presented = value.strip()
 
-    if presented != expected:
+    # compare_digest rather than !=: a plain comparison returns as soon as two
+    # bytes differ, and that timing difference is enough to recover a shared
+    # secret one character at a time.
+    if not presented or not secrets.compare_digest(presented, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or missing alert channel credentials",
@@ -178,6 +199,215 @@ async def publish_alert(
         stored=stored_id is not None,
         subscribers_notified=delivered,
     )
+
+
+# ---------------------------------------------------------------------------
+# Alert history and workflow
+# ---------------------------------------------------------------------------
+
+_ALERT_COLUMNS: Final = """
+        a.alert_id,
+        a.priority,
+        a.classification,
+        a.plate_number,
+        a.camera_id,
+        c.global_camera_code,
+        c.site_name,
+        ST_Y(a.alert_geom) AS latitude,
+        ST_X(a.alert_geom) AS longitude,
+        a.detected_at_utc_ms,
+        a.dispatched_at_utc_ms,
+        a.confidence,
+        a.vehicle,
+        a.subject,
+        a.evidence,
+        a.workflow_state,
+        a.acknowledged_by,
+        a.acknowledged_at,
+        a.assigned_to,
+        a.resolution_note,
+        a.received_at
+"""
+
+
+def _project_alert(record: asyncpg.Record, principal: Principal) -> AlertRead:
+    """Build the response, withholding identity data from lesser roles.
+
+    `subject` carries the named record behind an audited CCTNS request, which
+    sql/002 flags as SELECT-restricted. An operator sees the vehicle and the
+    classification - everything needed to act - without the person's identity.
+    """
+    row = dict(record)
+    for key in ("vehicle", "subject", "evidence"):
+        value = row.get(key)
+        if isinstance(value, str):
+            try:
+                row[key] = json.loads(value)
+            except ValueError:
+                row[key] = {}
+        elif value is None:
+            row[key] = {}
+
+    if not principal.at_least("DEPT_ADMIN"):
+        row["subject"] = {"restricted": True}
+
+    return AlertRead.model_validate(row)
+
+
+@router.get("", response_model=AlertListResponse, summary="Alert history")
+async def list_alerts(
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    connection: Annotated[asyncpg.Connection, Depends(get_connection)],
+    workflow_state: Annotated[str | None, Query(max_length=20)] = None,
+    priority: Annotated[str | None, Query(max_length=4)] = None,
+    plate: Annotated[str | None, Query(max_length=24)] = None,
+    camera_id: Annotated[str | None, Query()] = None,
+    since_utc_ms: Annotated[int | None, Query(ge=0)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AlertListResponse:
+    """Recorded alerts, newest first.
+
+    Until now `threat_alerts` was written and never read: an operator who
+    connected to the live socket a second after an alert fired had no way to
+    recover it. This is that way.
+    """
+    params: list[Any] = []
+    predicates: list[str] = []
+
+    scope = principal.department_scope
+    if scope is not None:
+        params.append(scope)
+        # Matched through the camera: threat_alerts has no department column of
+        # its own, and an alert belongs to whoever owns the camera that raised it.
+        predicates.append(f"c.department_id = ${len(params)}")
+
+    if workflow_state:
+        params.append(workflow_state.upper())
+        predicates.append(f"a.workflow_state = ${len(params)}")
+
+    if priority:
+        params.append(priority.upper())
+        predicates.append(f"a.priority = ${len(params)}")
+
+    if plate:
+        params.append(plate.upper().replace(" ", ""))
+        predicates.append(f"a.plate_number = ${len(params)}")
+
+    if camera_id:
+        params.append(camera_id)
+        predicates.append(f"a.camera_id = ${len(params)}::uuid")
+
+    if since_utc_ms is not None:
+        params.append(since_utc_ms)
+        predicates.append(f"a.detected_at_utc_ms >= ${len(params)}")
+
+    where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+
+    total = await connection.fetchval(
+        f"""
+        SELECT count(*) FROM threat_alerts a
+        LEFT JOIN cameras c ON c.id = a.camera_id
+        {where}
+        """,
+        *params,
+    )
+
+    params.extend([limit, offset])
+    records = await connection.fetch(
+        f"""
+        SELECT {_ALERT_COLUMNS}
+        FROM threat_alerts a
+        LEFT JOIN cameras c ON c.id = a.camera_id
+        {where}
+        ORDER BY a.detected_at_utc_ms DESC
+        LIMIT ${len(params) - 1} OFFSET ${len(params)}
+        """,
+        *params,
+    )
+
+    return AlertListResponse(
+        items=[_project_alert(record, principal) for record in records],
+        total=int(total or 0),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.patch(
+    "/{alert_id}",
+    response_model=AlertRead,
+    summary="Acknowledge, assign or resolve an alert",
+)
+async def update_alert(
+    alert_id: str,
+    payload: AlertWorkflowUpdate,
+    principal: Annotated[Principal, Depends(require_role("OPERATOR"))],
+    connection: Annotated[asyncpg.Connection, Depends(get_connection)],
+) -> AlertRead:
+    """Move an alert through its workflow.
+
+    Acknowledgement records who and when, so "someone is on this" is a fact
+    rather than an assumption.
+    """
+    existing = await connection.fetchrow(
+        """
+        SELECT a.alert_id, c.department_id
+        FROM threat_alerts a
+        LEFT JOIN cameras c ON c.id = a.camera_id
+        WHERE a.alert_id = $1
+        """,
+        alert_id,
+    )
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"alert '{alert_id}' not found"
+        )
+    principal.assert_can_access_department(existing["department_id"])
+
+    assignments: list[str] = []
+    params: list[Any] = []
+
+    if payload.workflow_state is not None:
+        params.append(payload.workflow_state)
+        assignments.append(f"workflow_state = ${len(params)}")
+        if payload.workflow_state == "ACKNOWLEDGED":
+            params.append(None if principal.is_service else UUID(principal.id))
+            assignments.append(f"acknowledged_by = ${len(params)}")
+            assignments.append("acknowledged_at = clock_timestamp()")
+
+    if payload.assigned_to is not None:
+        params.append(payload.assigned_to)
+        assignments.append(f"assigned_to = ${len(params)}")
+
+    if payload.resolution_note is not None:
+        params.append(payload.resolution_note)
+        assignments.append(f"resolution_note = ${len(params)}")
+
+    params.append(alert_id)
+    record = await connection.fetchrow(
+        f"""
+        WITH updated AS (
+            UPDATE threat_alerts SET {', '.join(assignments)}
+            WHERE alert_id = ${len(params)}
+            RETURNING *
+        )
+        SELECT {_ALERT_COLUMNS}
+        FROM updated a
+        LEFT JOIN cameras c ON c.id = a.camera_id
+        """,
+        *params,
+    )
+
+    logger.info(
+        "alert workflow updated",
+        extra={
+            "alert_id": alert_id,
+            "workflow_state": payload.workflow_state,
+            "actor": principal.label,
+        },
+    )
+    return _project_alert(record, principal)
 
 
 @ws_router.websocket("/alerts/p0")
