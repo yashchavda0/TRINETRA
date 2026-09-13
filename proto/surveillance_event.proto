@@ -138,8 +138,16 @@ message SurveillanceEvent {
   //   "color"             dominant object colour, lowercase, e.g. "white"
   //   "make"              vehicle manufacturer, e.g. "maruti"
   //   "model"             vehicle model, e.g. "swift"
+  //   "vehicle_type"      finer-grained body style than ObjectClass, e.g.
+  //                       "sedan", "suv", "auto-rickshaw" — set by
+  //                       services/vlm_agent, never by ANPR
   //   "confidence"        detection confidence, "0.0".."1.0"
   //   "track_id"          producer-local tracklet id, stable within one stream
+  //   "source_event_id"   set only on an attribute-tagging event published by
+  //                       services/vlm_agent: the event_id of the original
+  //                       detection this one enriches. Consumers must merge
+  //                       these attributes into that detection rather than
+  //                       treat the message as a second, independent sighting.
   map<string, string> attributes = 8;
 
   // Re-identification feature vector. EXACTLY 512 float32 values — no other

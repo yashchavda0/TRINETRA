@@ -21,6 +21,17 @@ api: yes
 apiAddress: :9997
 
 ###############################################################################
+# Playback - serves a recorded clip for a path + time range, and lists what
+# segments exist. Separate from the control API above: this is the read path
+# for stored video, used by GET /api/v2/streams/{camera_id}/recordings and
+# .../clip in app/routers/streams.py. Recording itself is turned on per-camera
+# through the control API (see _ensure_pull_path / the recording reconciler),
+# not here - retention (recordDeleteAfter) varies per camera.
+###############################################################################
+playback: yes
+playbackAddress: :9996
+
+###############################################################################
 # Authentication
 ###############################################################################
 # The built-in default user grants publish/read/playback but NOT api, so the

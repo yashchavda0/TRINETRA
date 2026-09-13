@@ -1,9 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowRight, Camera, Info, MapPin, Radio, Search, ShieldAlert } from 'lucide-react';
+import {
+  ArrowRight,
+  Camera,
+  Film,
+  Image as ImageIcon,
+  Info,
+  MapPin,
+  Radio,
+  Search,
+  ShieldAlert,
+} from 'lucide-react';
 
 import FlagSuspiciousDialog from '../components/FlagSuspiciousDialog.jsx';
+import PlateSnapshot from '../components/PlateSnapshot.jsx';
 
 import { PageHeader } from '../components/layout/AppShell.jsx';
 import {
@@ -29,6 +40,18 @@ const PAGE_SIZE = 50;
 
 function formatTime(ms) {
   return new Date(ms).toLocaleString();
+}
+
+// color/make/model/vehicle_type are written by services/vlm_agent's Tier A
+// tagging, merged into this same detection row's attributes by
+// workers/handoff_worker.py - no separate lookup needed, it rides on the
+// attributes column list_detections already selects wholesale.
+function vehicleSummary(attributes) {
+  if (!attributes) return null;
+  const { color, make, model, vehicle_type: vehicleType } = attributes;
+  const parts = [color, make, model].filter((part) => part && part !== 'unknown');
+  if (parts.length === 0 && !vehicleType) return null;
+  return { text: parts.join(' ') || null, vehicleType: vehicleType && vehicleType !== 'other' ? vehicleType : null };
 }
 
 const LIVE_TOKEN = import.meta.env.VITE_P0_ALERT_TOKEN || null;
@@ -193,6 +216,18 @@ function MovementTimeline({ plate, onFlag }) {
     enabled: Boolean(plate),
   });
 
+  // Which sightings currently show their plate crop. A Set rather than one
+  // id: an operator comparing two reads of the same plate wants both crops
+  // open at once, not one closing when the other opens.
+  const [expanded, setExpanded] = useState(new Set());
+  const toggleExpanded = (eventId) =>
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (next.has(eventId)) next.delete(eventId);
+      else next.add(eventId);
+      return next;
+    });
+
   if (!plate) return null;
 
   if (history.isLoading) {
@@ -283,6 +318,23 @@ function MovementTimeline({ plate, onFlag }) {
                   <span className="text-xs tabular-nums text-slate-500">
                     {formatTime(sighting.timestamp_utc_ms)}
                   </span>
+                  <Link
+                    to={`/vms/playback?camera=${sighting.camera_id}&at=${sighting.timestamp_utc_ms}`}
+                    className="flex items-center gap-1 text-xs text-accent hover:underline"
+                    title="Open the recorded clip around this sighting - the vehicle is highlighted at this instant"
+                  >
+                    <Film className="h-3 w-3" aria-hidden />
+                    View clip
+                  </Link>
+                  <button
+                    type="button"
+                    onClick={() => toggleExpanded(sighting.event_id)}
+                    className="flex items-center gap-1 text-xs text-accent hover:underline"
+                    title="Show the plate crop ANPR read at this sighting"
+                  >
+                    <ImageIcon className="h-3 w-3" aria-hidden />
+                    {expanded.has(sighting.event_id) ? 'Hide frame' : 'View frame'}
+                  </button>
                   {sighting.plate_confidence != null && (
                     <Badge tone={sighting.plate_confidence >= 0.8 ? 'success' : 'warn'}>
                       {Math.round(sighting.plate_confidence * 100)}% read
@@ -290,6 +342,14 @@ function MovementTimeline({ plate, onFlag }) {
                   )}
                   {isLast && <Badge tone="danger">most recent</Badge>}
                 </div>
+
+                {expanded.has(sighting.event_id) && (
+                  <PlateSnapshot
+                    eventId={sighting.event_id}
+                    plateNumber={sighting.plate_number}
+                    className="mt-2"
+                  />
+                )}
 
                 {hop && (
                   <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
@@ -499,6 +559,7 @@ export default function VehicleSearchPage() {
                 <tr>
                   <Th>Plate</Th>
                   <Th>Confidence</Th>
+                  <Th>Vehicle</Th>
                   <Th>Camera</Th>
                   <Th>Site</Th>
                   <Th>Seen</Th>
@@ -506,28 +567,43 @@ export default function VehicleSearchPage() {
                 </tr>
               </thead>
               <tbody>
-                {detections.data.items.map((item) => (
-                  <tr
-                    key={item.event_id}
-                    className="cursor-pointer hover:bg-ink-800/60"
-                    onClick={() => setSelectedPlate(item.plate_number)}
-                  >
-                    <Td className="font-mono text-xs text-accent">{item.plate_number}</Td>
-                    <Td className="text-xs tabular-nums">
-                      {item.plate_confidence != null
-                        ? `${Math.round(item.plate_confidence * 100)}%`
-                        : '—'}
-                    </Td>
-                    <Td className="font-mono text-xs">
-                      {item.global_camera_code || item.camera_id.slice(0, 8)}
-                    </Td>
-                    <Td className="max-w-[220px] truncate text-xs">{item.site_name || '—'}</Td>
-                    <Td className="whitespace-nowrap text-xs text-slate-400">
-                      {formatTime(item.timestamp_utc_ms)}
-                    </Td>
-                    <Td className="text-xs text-slate-500">{item.object_class}</Td>
-                  </tr>
-                ))}
+                {detections.data.items.map((item) => {
+                  const vehicle = vehicleSummary(item.attributes);
+                  return (
+                    <tr
+                      key={item.event_id}
+                      className="cursor-pointer hover:bg-ink-800/60"
+                      onClick={() => setSelectedPlate(item.plate_number)}
+                    >
+                      <Td className="font-mono text-xs text-accent">{item.plate_number}</Td>
+                      <Td className="text-xs tabular-nums">
+                        {item.plate_confidence != null
+                          ? `${Math.round(item.plate_confidence * 100)}%`
+                          : '—'}
+                      </Td>
+                      <Td className="text-xs">
+                        {vehicle ? (
+                          <span className="flex flex-wrap items-center gap-1">
+                            {vehicle.text && <span className="text-slate-300">{vehicle.text}</span>}
+                            {vehicle.vehicleType && (
+                              <Badge tone="default">{vehicle.vehicleType}</Badge>
+                            )}
+                          </span>
+                        ) : (
+                          <span className="text-slate-600">—</span>
+                        )}
+                      </Td>
+                      <Td className="font-mono text-xs">
+                        {item.global_camera_code || item.camera_id.slice(0, 8)}
+                      </Td>
+                      <Td className="max-w-[220px] truncate text-xs">{item.site_name || '—'}</Td>
+                      <Td className="whitespace-nowrap text-xs text-slate-400">
+                        {formatTime(item.timestamp_utc_ms)}
+                      </Td>
+                      <Td className="text-xs text-slate-500">{item.object_class}</Td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </Table>
           )}

@@ -452,6 +452,39 @@ class StreamStateResponse(BaseModel):
     ready_time: str | None = Field(default=None, description="When the source became ready, UTC")
 
 
+class RecordingSegment(BaseModel):
+    """One recorded file on disk, as MediaMTX's playback server reports it.
+
+    Deliberately carries no filesystem path - only start time and duration, so
+    the console can address a segment by when it was recorded without ever
+    learning where `recordings_dir` actually is.
+    """
+
+    start: datetime = Field(description="UTC start time of this segment")
+    duration_seconds: float = Field(ge=0)
+
+
+class RecordingsResponse(BaseModel):
+    """Available recorded segments for one camera, over the requested window.
+
+    Deliberately does not carry detection markers itself: `detections`
+    already has a scope-aware, department-filtered read path
+    (`GET /api/v1/detections?camera_id=&since_utc_ms=&until_utc_ms=`) built for
+    exactly this query, and duplicating that here would mean reimplementing
+    its department-scope predicate a second time. The console calls both and
+    merges them client-side.
+    """
+
+    camera_id: UUID
+    path: str
+    segments: list[RecordingSegment] = Field(default_factory=list)
+    note: str | None = Field(
+        default=None,
+        description="Set when the segment index could not be read, e.g. the "
+        "playback server being unreachable - segments is then empty, not wrong",
+    )
+
+
 class AlertPublishRequest(BaseModel):
     """A threat alert pushed in by the Model 4 worker for fan-out and audit.
 
@@ -625,6 +658,17 @@ class DetectionRead(BaseModel):
     longitude: float | None = None
     embedding_accepted: bool
     snapshot_uri: str | None = None
+    # Normalised [0, 1], origin top-left - the frame position of the detected
+    # vehicle at the instant of capture, exactly as the analytics bus carries it
+    # (see BBox in proto/surveillance_event.proto). Not always present: the
+    # producer only sets it when its own detector found the object, so an
+    # older event or a producer without frame-level detection has none of the
+    # four. The console draws this over the recorded clip at the matching
+    # playback instant - never inferred, only what was actually observed.
+    bbox_x_min: float | None = None
+    bbox_y_min: float | None = None
+    bbox_x_max: float | None = None
+    bbox_y_max: float | None = None
     attributes: dict[str, object] = Field(default_factory=dict)
 
 
@@ -699,6 +743,51 @@ class MovementHistory(BaseModel):
     distinct_cameras: int = Field(ge=0)
     sightings: list[DetectionRead] = Field(default_factory=list)
     hops: list[MovementHop] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Scene events - agentic video understanding, Tier B (services/vlm_agent)
+# ---------------------------------------------------------------------------
+
+
+class SceneEventRead(BaseModel):
+    """One agentic (VLM) scene/event finding over a camera's trigger window.
+
+    Not a per-object detection - see DetectionRead for those. A finding at or
+    above the alert confidence threshold for an operationally urgent type
+    also reaches AlertRead through the existing alert path; every finding,
+    regardless of severity, is readable here.
+    """
+
+    # protected_namespaces=(): pydantic reserves the "model_" prefix for its
+    # own config fields and otherwise warns on model_version below. The wire
+    # field is named for what it holds - which VLM build produced this finding
+    # - and that name predates and is unrelated to pydantic's own "model_*".
+    model_config = ConfigDict(from_attributes=True, protected_namespaces=())
+
+    scene_event_id: UUID
+    camera_id: UUID
+    global_camera_code: str | None = None
+    site_name: str | None = None
+    window_start_utc_ms: int
+    window_end_utc_ms: int
+    event_type: str
+    confidence: float
+    rationale: str | None = None
+    implicated_target_ids: list[str] = Field(default_factory=list)
+    clip_uri: str | None = None
+    model_version: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    workflow_state: str = "NEW"
+    ingested_at: datetime
+
+
+class SceneEventListResponse(BaseModel):
+    items: list[SceneEventRead]
+    total: int = Field(ge=0)
+    limit: int
+    offset: int
     caveat: str = Field(
         default=(
             "Sightings are ANPR reads, not a tracked path. A gap between two "

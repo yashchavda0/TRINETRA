@@ -11,6 +11,11 @@ docker/postgres.env
 # Development PKI. Contains unencrypted private keys, including the CA's.
 certs/
 
+# Local media storage: ANPR snapshot JPEGs (anpr_snapshot_dir) and recorded
+# camera segments (recordings_dir / the mediamtx bind mount). Both are
+# generated at runtime and can reach hundreds of GB - never committed.
+data/
+
 # Protobuf codegen output: a build artifact of proto/surveillance_event.proto.
 # Regenerate with scripts/gen_proto.ps1 rather than committing a stale copy.
 generated/

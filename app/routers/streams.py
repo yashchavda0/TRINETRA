@@ -32,17 +32,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Annotated, Final
 from urllib.parse import quote, urlparse, urlunparse
 
 import asyncpg
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 
 from app.auth.dependencies import require_role
 from app.config import Settings, get_settings
 from app.database import get_connection, get_pool
-from app.schemas import StreamStateResponse, WebRTCAnswerResponse, WebRTCOfferRequest
+from app.schemas import (
+    RecordingSegment,
+    RecordingsResponse,
+    StreamStateResponse,
+    WebRTCAnswerResponse,
+    WebRTCOfferRequest,
+)
 
 logger: Final = logging.getLogger(__name__)
 
@@ -240,23 +248,19 @@ async def _describe_path(path_name: str, settings: Settings) -> str:
     return "the camera source never became ready"
 
 
-async def _ensure_pull_path(
-    camera_id: uuid.UUID, stream_url: str, settings: Settings
-) -> str:
-    """Create or refresh an on-demand MediaMTX path pulling from a camera.
+async def _apply_path_config(
+    path_name: str, config: dict[str, object], camera_id: uuid.UUID, settings: Settings
+) -> None:
+    """POST a new MediaMTX path config, falling back to PATCH when it exists.
 
-    Used for real cameras, whose RTSP endpoint lives on the camera itself rather
-    than on our media server. `sourceOnDemand` means MediaMTX only opens the
-    camera's stream while a viewer is watching, which matters at fleet scale.
+    Shared by the on-demand viewing path and the continuous recording path:
+    both configure a `cam-<uuid>` path, they just choose different values for
+    `sourceOnDemand`/`record`/etc. Raises on any failure; callers that can
+    tolerate one camera's config failing (the recording reconciler) catch
+    around this rather than this function swallowing anything itself.
     """
-    path_name = f"cam-{camera_id}"
     client = await _get_media_client(settings)
     api_base = (settings.mediamtx_api_base_url or "").rstrip("/")
-    config = {
-        "source": stream_url,
-        "sourceOnDemand": True,
-        "sourceProtocol": "tcp",
-    }
     control_timeout = httpx.Timeout(settings.mediamtx_request_timeout_seconds)
 
     try:
@@ -266,12 +270,13 @@ async def _ensure_pull_path(
             timeout=control_timeout,
         )
 
-        # "path already exists" is the normal second-viewer case, but the stored
-        # source may be stale - a corrected stream_url would otherwise never take
-        # effect, and the camera would stream from its old address forever.
+        # "path already exists" is the normal second-viewer (or second
+        # reconcile tick) case, but the stored config may be stale - a
+        # corrected stream_url or retention_days would otherwise never take
+        # effect.
         if response.status_code >= 400 and "already exists" in response.text.lower():
             logger.debug(
-                "media path exists; refreshing its source",
+                "media path exists; refreshing its config",
                 extra={"camera_id": str(camera_id), "path": path_name},
             )
             # This endpoint is registered under the HTTP PATCH verb only -
@@ -313,6 +318,55 @@ async def _ensure_pull_path(
             detail=f"media server refused the camera path ({response.status_code})",
         )
 
+
+async def _ensure_pull_path(
+    camera_id: uuid.UUID, stream_url: str, settings: Settings
+) -> str:
+    """Create or refresh an on-demand MediaMTX path pulling from a camera.
+
+    Used for a camera that is not being continuously recorded: MediaMTX only
+    opens its stream while a viewer is watching. A camera whose recording
+    reconciler already keeps its path up continuously must not go through
+    here - see the `recording_enabled` check in `_negotiate_via_mediamtx`.
+    """
+    path_name = f"cam-{camera_id}"
+    config = {
+        "source": stream_url,
+        "sourceOnDemand": True,
+        "sourceProtocol": "tcp",
+    }
+    await _apply_path_config(path_name, config, camera_id, settings)
+    return path_name
+
+
+async def _ensure_recording_path(
+    camera_id: uuid.UUID, stream_url: str, retention_days: int, settings: Settings
+) -> str:
+    """Create or refresh a continuously-recording MediaMTX path for a camera.
+
+    `sourceOnDemand: False` is the whole point: recording needs the source
+    running whether or not anyone is watching, unlike `_ensure_pull_path`'s
+    on-demand viewing case. A live viewer for this camera becomes just another
+    reader of the path this creates - see `_negotiate_via_mediamtx`.
+
+    `recordDeleteAfter` is MediaMTX's own retention mechanism, computed from
+    the camera's `retention_days` (or the configured default when unset). It
+    operates at segment granularity, so actual retention can run up to one
+    segment duration longer than requested - documented behaviour, not a bug
+    here.
+    """
+    path_name = f"cam-{camera_id}"
+    config = {
+        "source": stream_url,
+        "sourceOnDemand": False,
+        "sourceProtocol": "tcp",
+        "record": True,
+        "recordPath": f"{settings.recordings_dir}/{camera_id}/%Y-%m-%d_%H-%M-%S-%f",
+        "recordFormat": settings.recording_format,
+        "recordSegmentDuration": f"{settings.recording_segment_seconds}s",
+        "recordDeleteAfter": f"{retention_days * 24}h",
+    }
+    await _apply_path_config(path_name, config, camera_id, settings)
     return path_name
 
 
@@ -322,7 +376,11 @@ async def _ensure_pull_path(
 
 
 async def _negotiate_via_mediamtx(
-    payload: WebRTCOfferRequest, stream_url: str, settings: Settings
+    payload: WebRTCOfferRequest,
+    stream_url: str,
+    settings: Settings,
+    *,
+    recording_enabled: bool,
 ) -> tuple[str, str, str]:
     """Run the WHEP exchange. Returns (answer_sdp, session_id, resource_url)."""
     is_published = _is_mediamtx_source(stream_url, settings)
@@ -333,6 +391,14 @@ async def _negotiate_via_mediamtx(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="camera stream_url names no MediaMTX path",
             )
+    elif recording_enabled:
+        # The recording reconciler already keeps this path up continuously
+        # (sourceOnDemand: False, record: True). Re-asserting _ensure_pull_path's
+        # on-demand config here would flip it back to on-demand and silently
+        # stop recording until the next reconcile tick re-applies it - so a
+        # viewer clicking a camera must not touch its path config at all, only
+        # read from the path that already exists.
+        path_name = f"cam-{payload.camera_id}"
     else:
         path_name = await _ensure_pull_path(payload.camera_id, stream_url, settings)
 
@@ -527,7 +593,8 @@ async def webrtc_offer(
         )
 
     record = await connection.fetchrow(
-        "SELECT stream_url, status FROM cameras WHERE id = $1", payload.camera_id
+        "SELECT stream_url, status, recording_enabled FROM cameras WHERE id = $1",
+        payload.camera_id,
     )
     if record is None:
         raise HTTPException(
@@ -542,8 +609,14 @@ async def webrtc_offer(
 
     stream_url = _with_grid_credentials(record["stream_url"], settings)
     if backend == "mediamtx":
+        # Must agree with _reconcile_recording_paths' own WHERE clause, or a
+        # camera the reconciler is about to bring up continuously could still
+        # be flipped to on-demand by a viewer in the gap before its first tick.
         sdp_answer, session_id, resource = await _negotiate_via_mediamtx(
-            payload, stream_url, settings
+            payload,
+            stream_url,
+            settings,
+            recording_enabled=bool(record["recording_enabled"]),
         )
     else:
         sdp_answer, session_id, resource = await _negotiate_via_relay(
@@ -634,6 +707,287 @@ async def stream_state(
         tracks=[str(track) for track in (body.get("tracks") or [])],
         ready_time=body.get("readyTime"),
     )
+
+
+async def _list_recorded_segments(
+    path_name: str, start: datetime, end: datetime, settings: Settings
+) -> tuple[list[RecordingSegment], str | None]:
+    """Ask MediaMTX's playback server what segments exist for a path/window.
+
+    MediaMTX 1.9.3 ships a playback server (mediamtx.yml's `playback:` block)
+    separate from the control API, but its exact query-string contract was not
+    something this codebase's own testing could confirm without the server
+    running - so this is written defensively: any shape mismatch is logged and
+    reported back as an empty list with `note` set, never a 500. First thing to
+    confirm once this is live is the real request/response shape against the
+    running container, and adjust the query below to match.
+    """
+    base = (settings.mediamtx_playback_base_url or "").rstrip("/")
+    if not base:
+        return [], "playback server is not configured"
+
+    client = await _get_media_client(settings)
+    try:
+        response = await client.get(
+            f"{base}/list",
+            params={
+                "path": path_name,
+                "start": start.astimezone(timezone.utc).isoformat(),
+                "end": end.astimezone(timezone.utc).isoformat(),
+            },
+            timeout=httpx.Timeout(settings.mediamtx_request_timeout_seconds),
+        )
+        if response.status_code != status.HTTP_200_OK:
+            return [], f"playback server returned {response.status_code}"
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning(
+            "recording segment list unavailable",
+            extra={"path": path_name, "error": str(exc), "error_type": type(exc).__name__},
+        )
+        return [], "playback server did not answer"
+
+    entries = body if isinstance(body, list) else body.get("items", [])
+    segments: list[RecordingSegment] = []
+    for entry in entries:
+        try:
+            segments.append(
+                RecordingSegment(
+                    start=entry["start"],
+                    duration_seconds=float(entry.get("duration", 0)),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue  # one malformed entry must not drop the whole window
+
+    return segments, None
+
+
+@router.get(
+    "/streams/{camera_id}/recordings",
+    response_model=RecordingsResponse,
+    summary="Recorded segments available for a camera in a time window",
+)
+async def stream_recordings(
+    camera_id: uuid.UUID,
+    connection: Annotated[asyncpg.Connection, Depends(get_connection)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    start: Annotated[datetime, Query(description="UTC window start")],
+    end: Annotated[datetime, Query(description="UTC window end")],
+) -> RecordingsResponse:
+    """List what has been recorded for this camera between `start` and `end`.
+
+    Carries no detection data - see `GET /api/v1/detections` for the
+    department-scoped, already-built read path for that; the console calls
+    both and merges them for the playback timeline.
+    """
+    exists = await connection.fetchval("SELECT 1 FROM cameras WHERE id = $1", camera_id)
+    if exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"camera '{camera_id}' is not registered",
+        )
+    if end <= start:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="end must be after start",
+        )
+
+    path_name = f"cam-{camera_id}"
+    segments, note = await _list_recorded_segments(path_name, start, end, settings)
+    return RecordingsResponse(camera_id=camera_id, path=path_name, segments=segments, note=note)
+
+
+@router.get(
+    "/streams/{camera_id}/clip",
+    summary="A recorded clip for a camera, as MP4",
+)
+async def stream_clip(
+    camera_id: uuid.UUID,
+    connection: Annotated[asyncpg.Connection, Depends(get_connection)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    start: Annotated[datetime, Query(description="UTC clip start")],
+    duration_seconds: Annotated[float, Query(gt=0, le=3600, description="Clip length")] = 30.0,
+) -> StreamingResponse:
+    """Proxy MediaMTX's playback `/get` for one camera's recorded window.
+
+    Streamed rather than buffered, so a multi-minute clip does not sit in this
+    process's memory. Same discovery caveat as `_list_recorded_segments`: the
+    exact query shape is provisional until confirmed against the running
+    playback server.
+    """
+    exists = await connection.fetchval("SELECT 1 FROM cameras WHERE id = $1", camera_id)
+    if exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"camera '{camera_id}' is not registered",
+        )
+
+    base = (settings.mediamtx_playback_base_url or "").rstrip("/")
+    if not base:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="recording playback is not configured (MEDIAMTX_PLAYBACK_BASE_URL unset)",
+        )
+
+    path_name = f"cam-{camera_id}"
+    client = await _get_media_client(settings)
+    try:
+        upstream = client.build_request(
+            "GET",
+            f"{base}/get",
+            params={
+                "path": path_name,
+                "start": start.astimezone(timezone.utc).isoformat(),
+                "duration": duration_seconds,
+            },
+        )
+        response = await client.send(upstream, stream=True)
+    except httpx.HTTPError as exc:
+        raise _media_unreachable(settings, exc) from exc
+
+    if response.status_code != status.HTTP_200_OK:
+        await response.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"no recorded clip for camera '{camera_id}' at {start.isoformat()} "
+                f"+{duration_seconds:g}s"
+            ),
+        )
+
+    return StreamingResponse(
+        response.aiter_bytes(),
+        media_type=response.headers.get("content-type", "video/mp4"),
+        background=response.aclose,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Recording reconciliation
+# ---------------------------------------------------------------------------
+
+# camera_id -> (stream_url, retention_days) last successfully applied. Lets
+# the reconciler skip cameras whose config has not changed, rather than
+# re-POSTing identical config to MediaMTX every tick forever - PATCHing an
+# unchanged path is at best wasted work and at worst (unconfirmed either way)
+# risks a needless source restart, which would show up as exactly the kind of
+# dropout this feature exists to capture.
+_recording_state: dict[uuid.UUID, tuple[str, int]] = {}
+_recording_task: asyncio.Task[None] | None = None
+
+
+async def _reconcile_recording_paths(settings: Settings) -> None:
+    """Ensure every ACTIVE, recording-enabled camera has a continuous path.
+
+    Recording needs the source running whether or not anyone is watching, so
+    this - not a viewer connecting - is what brings each camera's pull up.
+    `recording_enabled` is `NOT NULL DEFAULT false` on `cameras`, so a camera
+    only joins the recording set once that column is explicitly turned on -
+    see the one-time backfill this feature shipped with, which sets it for
+    every existing row.
+
+    Published-local paths (test videos already streaming to this MediaMTX
+    instance under their own path name) are out of scope: they do not use the
+    `cam-<uuid>` naming this function assumes, and none of the real fleet uses
+    them.
+    """
+    pool = get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            """
+            SELECT id, stream_url, retention_days
+            FROM cameras
+            WHERE status = 'ACTIVE' AND recording_enabled
+            ORDER BY global_camera_code
+            """
+        )
+
+    seen: set[uuid.UUID] = set()
+    for row in rows:
+        camera_id = row["id"]
+        raw_stream_url = row["stream_url"]
+        if _is_mediamtx_source(raw_stream_url, settings):
+            continue  # published-local test video; not this reconciler's job
+
+        seen.add(camera_id)
+        stream_url = _with_grid_credentials(raw_stream_url, settings)
+        retention_days = row["retention_days"] or settings.default_retention_days
+
+        if _recording_state.get(camera_id) == (stream_url, retention_days):
+            continue  # unchanged since last tick; nothing to push
+
+        try:
+            await _ensure_recording_path(camera_id, stream_url, retention_days, settings)
+            _recording_state[camera_id] = (stream_url, retention_days)
+        except Exception:
+            logger.exception(
+                "failed to ensure recording path", extra={"camera_id": str(camera_id)}
+            )
+            continue
+
+        logger.info(
+            "recording path established",
+            extra={"camera_id": str(camera_id), "retention_days": retention_days},
+        )
+        # Only actual new dials are staggered - a camera whose config was
+        # already current above never reaches this sleep. Recording needs
+        # every camera connected at once, not just the one being watched;
+        # dialling all of them in the same instant is simultaneous connections
+        # against an external grid that has already shown auth failures under
+        # far lighter load.
+        await asyncio.sleep(settings.recording_stagger_seconds)
+
+    # Cameras that left the recording set (deactivated, or recording_enabled
+    # flipped off) are simply forgotten here - their already-written segments
+    # are left alone to expire on their own recordDeleteAfter. Nothing deletes
+    # the MediaMTX path itself; a future viewer would just re-create it
+    # on-demand through the normal _ensure_pull_path branch.
+    for camera_id in list(_recording_state):
+        if camera_id not in seen:
+            del _recording_state[camera_id]
+
+
+async def _recording_reconcile_loop(settings: Settings) -> None:
+    while True:
+        try:
+            await _reconcile_recording_paths(settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("recording reconciliation iteration failed")
+        await asyncio.sleep(settings.recording_reconcile_interval_seconds)
+
+
+def start_recording_reconciler(settings: Settings) -> None:
+    """Start the recording reconciler, unless MediaMTX is not the backend."""
+    global _recording_task
+
+    if settings.media_backend != "mediamtx":
+        logger.info("recording reconciler not started: media backend is not mediamtx")
+        return
+    if _recording_task is not None and not _recording_task.done():
+        return
+
+    _recording_task = asyncio.create_task(
+        _recording_reconcile_loop(settings), name="recording-reconciler"
+    )
+    logger.info(
+        "recording reconciler started",
+        extra={"interval_seconds": settings.recording_reconcile_interval_seconds},
+    )
+
+
+async def stop_recording_reconciler() -> None:
+    global _recording_task
+
+    if _recording_task is not None:
+        task, _recording_task = _recording_task, None
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -53,3 +53,16 @@ websockets>=14.0,<16.0
 # torch-geometric additionally wants torch already present at install time.
 torch>=2.2.0,<3.0.0
 torch-geometric>=2.5.0,<3.0.0
+
+# services/anpr plate detector + OCR. Not installed by default in this list -
+# services/anpr/reader.py imports both lazily inside PlateReader.__init__ and
+# fails loudly with a clear message if either is missing, the same guard
+# services/vlm_agent uses for llama-cpp-python below.
+#   pip install open-image-models fast-plate-ocr
+
+# services/vlm_agent local VLM runtime (Tier A vehicle attribute tagging and
+# Tier B scene/event reasoning). Optional: only services/vlm_agent/vlm_client.py
+# imports it, lazily inside VLMClient.__init__, so nothing else in the tree
+# needs it installed. Ships a CPU build by default; see the llama-cpp-python
+# docs for a CUDA/Metal build if the VLM host has a GPU.
+#   pip install llama-cpp-python

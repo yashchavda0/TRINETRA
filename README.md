@@ -645,3 +645,7 @@ admin@trinetra.local	TrinetraDev!2026	State Administrator	all 35 cameras, every 
 police.admin@trinetra.local	PoliceDev!2026	Department Admin (POLICE)	34 cameras
 rto.admin@trinetra.local	RtoDev!2026	Department Admin (RTO)	1 camera
 operator@trinetra.local	OperDev!2026	Operator (POLICE)	34 cameras, no admin screens
+
+
+- Agentic Video understanding can be implemented in this and at which layer and how?
+- Parallel to ANPR can we also detect the Vehicles and capture the metadata of thme continously. so we can get all the information of vehicle not only Number plate.

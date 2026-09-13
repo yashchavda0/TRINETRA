@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
@@ -93,6 +94,13 @@ class Settings(BaseSettings):
     kafka_consumer_group: str = "trinetra-handoff-worker"
     kafka_poll_timeout_seconds: float = Field(default=1.0, gt=0)
 
+    # Scene/anomaly findings (services/vlm_agent Tier B) travel on their own
+    # topic, isolated from kafka_topic_raw, so their volume and schema can
+    # never affect the Re-ID/handoff/watchlist consumer already subscribed to
+    # the detection stream.
+    kafka_topic_scene_events: str = "scene-events-raw"
+    kafka_scene_events_consumer_group: str = "trinetra-scene-event-worker"
+
     # --- Model 4 engine (engine/) ----------------------------------------
     # These override the module-level constants the engine hardcodes today.
     engine_device: str | None = None  # None -> CUDA when present, else CPU
@@ -151,6 +159,37 @@ class Settings(BaseSettings):
     # but working camera fail as though it were broken.
     mediamtx_source_start_timeout_seconds: float = Field(default=20.0, gt=0)
 
+    # --- Recording ---------------------------------------------------------
+    # MediaMTX's own playback server (see mediamtx.yml's `playback:` block),
+    # not the control API above - this is the read path for stored video.
+    mediamtx_playback_base_url: str | None = "http://127.0.0.1:9996"
+    # Container-side path; docker-compose.infra.yml bind-mounts data/recordings
+    # here, the same posture as anpr_snapshot_dir.
+    recordings_dir: str = "/recordings"
+    # 15 minutes: small enough that fetching the clip around one detection
+    # does not mean downloading an hour of footage, large enough not to
+    # explode file count at fleet scale.
+    recording_segment_seconds: int = Field(default=900, gt=0)
+    # fmp4 is the only one of MediaMTX's two recording formats that handles
+    # every codec this grid serves - H.264 and H.265 alike. mpegts is more
+    # limited in codec support.
+    recording_format: str = "fmp4"
+    # How often the reconciler re-reads the camera table and re-asserts every
+    # ACTIVE camera's MediaMTX path config (source, record, recordDeleteAfter).
+    # Frequent enough that a retention_days edit in the Registry takes effect
+    # within a couple of minutes; infrequent enough not to hammer the control
+    # API for no reason.
+    recording_reconcile_interval_seconds: float = Field(default=120.0, gt=0)
+    # Spacing between each camera's initial dial when the reconciler brings up
+    # continuous pulls for the first time (or after a restart). Recording needs
+    # every camera connected at once, not just the one being watched - without
+    # this spacing that is 30 simultaneous connections against an external grid
+    # that has already shown auth failures under far lighter load.
+    recording_stagger_seconds: float = Field(default=2.0, ge=0)
+    # Applied when a camera's retention_days is unset (NULL) rather than
+    # leaving it to record forever by default.
+    default_retention_days: int = Field(default=7, gt=0)
+
     # --- External live-feed grid (evaluation) -----------------------------
     # The grid splits its access model across two hosts: a CDN serves the
     # catalogue and HLS on any network, while RTSP and WebRTC are served
@@ -206,13 +245,87 @@ class Settings(BaseSettings):
     # Detector confidence floor for OCR, and the higher floor for publishing.
     # A guess on the bus becomes a permanent detections row and can raise a
     # false P0, so publishing is held to a stricter bar than looking.
-    anpr_min_detection_confidence: float = Field(default=0.4, ge=0.0, le=1.0)
-    anpr_min_publish_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    #
+    # Measured live against the test grid: genuine plates scored 0.65-0.74;
+    # a motion-blur streak the detector mistook for a plate and a storefront
+    # sign both scored 0.56-0.58. There is real separation to hold the line on
+    # here, on top of the format-validity gate in AnprService._publish, which
+    # is what actually stops a non-plate detection from being published.
+    anpr_min_detection_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    anpr_min_publish_confidence: float = Field(default=0.65, ge=0.0, le=1.0)
     # Same plate at the same camera inside this window publishes once. Without
     # it one vehicle crossing one junction puts thirty events on the bus.
     anpr_dedup_seconds: float = Field(default=30.0, gt=0)
     anpr_save_snapshots: bool = True
     anpr_snapshot_dir: str = "data/anpr_snapshots"
+
+    # --- VLM agent (services/vlm_agent) -----------------------------------
+    # Local-first by design: a hosted multimodal API becomes prohibitively
+    # expensive and network-latency-bound at the fleet scale the analytics
+    # bus targets, and self-hosting keeps camera imagery off a third party's
+    # network. Path to a local GGUF checkpoint (e.g. a quantized Moondream2 /
+    # SmolVLM build) loaded once at startup, the same posture as
+    # PlateReader.__init__ loading its ONNX sessions once and reusing them.
+    vlm_agent_model_path: str = "models/vlm-agent.gguf"
+    vlm_agent_mmproj_path: str = "models/vlm-agent-mmproj.gguf"
+    vlm_agent_context_tokens: int = Field(default=2048, ge=256)
+    # Consumer of surveillance-events-raw, filtered to vehicle object classes,
+    # for Tier A attribute tagging. Small: this is enrichment, not the primary
+    # detection path, and it must never compete for consumer group partitions
+    # with a second workers/handoff_worker.py-style replica.
+    vlm_agent_kafka_consumer_group: str = "trinetra-vlm-agent-tier-a"
+    # Bounded queue between the Tier A Kafka consumer and the single VLM
+    # inference task, same backpressure shape as anpr_queue_size: full means
+    # drop-and-count, never block the consumer indefinitely.
+    vlm_agent_tier_a_queue_size: int = Field(default=32, ge=1)
+    vlm_agent_snapshot_fetch_timeout_seconds: float = Field(default=5.0, gt=0)
+    vlm_agent_report_seconds: float = Field(default=60.0, gt=0)
+
+    # Tier B (agentic anomaly/event reasoning) trigger thresholds.
+    vlm_agent_motion_threshold: float = Field(default=0.004, ge=0.0, le=1.0)
+    # A target's Re-ID track lingering in one camera's FOV past this many
+    # seconds becomes a loitering candidate for the reasoning call.
+    vlm_agent_loitering_dwell_seconds: float = Field(default=120.0, gt=0)
+    # Length of the clip buffered around a trigger for the reasoning call to
+    # inspect. Sized per the plan's own note that COLLISION needs near-real-
+    # time reasoning while LOITERING is inherently multi-second-to-minute -
+    # this is the ceiling a single trigger window buffers, not a fixed delay.
+    vlm_agent_clip_seconds: float = Field(default=8.0, gt=0)
+    vlm_agent_tier_b_queue_size: int = Field(default=16, ge=1)
+    # Distinct Re-ID targets seen at one camera within the lookback window
+    # before a CROWD_DENSITY candidate is raised for the reasoning call.
+    vlm_agent_crowd_density_min_targets: int = Field(default=8, ge=1)
+    # How often the Tier B trigger engine re-scans detections for candidates.
+    vlm_agent_trigger_scan_seconds: float = Field(default=15.0, gt=0)
+    # A camera that already raised a given event_type stays quiet for this
+    # long before it can raise the same type again - otherwise a target that
+    # keeps loitering re-triggers the (expensive) reasoning call every scan.
+    vlm_agent_trigger_cooldown_seconds: float = Field(default=300.0, gt=0)
+    # Confidence floor below which a Tier B finding is stored for investigation
+    # but never fanned out through the alert path.
+    vlm_agent_alert_confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
+    # Which backend VLMClient calls. "local" loads a GGUF checkpoint via
+    # llama-cpp-python in-process (needs vlm_agent_model_path/mmproj_path to
+    # point at real files). "hosted" skips that entirely and calls an
+    # OpenAI-compatible /v1/chat/completions endpoint over HTTP instead - the
+    # fields directly below. Defaulting to "local" keeps existing deployments
+    # that already have a GGUF configured unaffected; flip to "hosted" to run
+    # against a self-hosted (or third-party) OpenAI-compatible server.
+    vlm_agent_backend: Literal["local", "hosted"] = "local"
+
+    # Hosted OpenAI-compatible endpoint. Doubles as both a primary backend
+    # (vlm_agent_backend="hosted") and, in a future pass, a rare escalation
+    # path from the local backend - same connection details either way.
+    # Empty disables hosted use outright.
+    vlm_agent_hosted_api_base_url: str | None = None
+    vlm_agent_hosted_api_key: str | None = None
+    vlm_agent_hosted_model_name: str = "openai/gpt-oss-20b"
+    vlm_agent_hosted_request_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Only meaningful for a future local-primary + hosted-escalation mode;
+    # unused while vlm_agent_backend="hosted" calls it directly for every
+    # request.
+    vlm_agent_hosted_cooldown_seconds: float = Field(default=120.0, gt=0)
 
     # --- Stream relay (cmd/stream_relay) ---------------------------------
     # Empty means "relay not deployed": the WebRTC proxy then returns 503 and

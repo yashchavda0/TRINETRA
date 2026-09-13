@@ -121,6 +121,10 @@ class Counters:
     plates_published: int = 0
     plates_deduped: int = 0
     plates_low_confidence: int = 0
+    #: OCR text that never matched the plate format - a sign, a motion-blur
+    #: streak, anything the detector mistook for a plate shape. Dropped before
+    #: publish rather than recorded as a plate reading.
+    plates_format_rejected: int = 0
     grab_failures: int = 0
     inference_ms_total: float = 0.0
 
@@ -138,6 +142,7 @@ class Counters:
             "plates_published": self.plates_published,
             "plates_deduped": self.plates_deduped,
             "plates_low_confidence": self.plates_low_confidence,
+            "plates_format_rejected": self.plates_format_rejected,
             "grab_failures": self.grab_failures,
         }
 
@@ -635,6 +640,16 @@ class AnprService:
 
     async def _publish(self, frame: Frame, reading: PlateReading) -> None:
         """Publish one plate reading to the analytics bus."""
+        if not reading.format_valid:
+            # The detector fired on something, and OCR transcribed whatever
+            # text was there, but it never matched an Indian registration
+            # format - a sign, a motion-blur streak, anything rectangular
+            # enough to look like a plate. That is not evidence of a vehicle
+            # and must never reach detections, a movement history, or a
+            # watchlist match.
+            self.counters.plates_format_rejected += 1
+            return
+
         if reading.confidence < self.settings.anpr_min_publish_confidence:
             self.counters.plates_low_confidence += 1
             return

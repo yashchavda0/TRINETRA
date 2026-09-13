@@ -19,6 +19,8 @@ import json
 import logging
 import math
 import re
+import uuid
+from pathlib import Path
 from typing import Annotated, Any, Final
 
 import asyncpg
@@ -32,6 +34,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import FileResponse
 
 from app.auth.dependencies import Principal, get_current_principal
 from app.config import Settings, get_settings
@@ -75,6 +78,10 @@ _DETECTION_COLUMNS: Final = """
         ST_X(d.detection_geom) AS longitude,
         d.embedding_accepted,
         d.snapshot_uri,
+        d.bbox_x_min,
+        d.bbox_y_min,
+        d.bbox_x_max,
+        d.bbox_y_max,
         d.attributes
 """
 
@@ -295,6 +302,63 @@ async def plate_movements(
         sightings=sightings,
         hops=hops,
     )
+
+
+@router.get(
+    "/{event_id}/snapshot",
+    summary="The ANPR plate-crop image captured for one detection",
+)
+async def detection_snapshot(
+    event_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    connection: Annotated[asyncpg.Connection, Depends(get_connection)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> FileResponse:
+    """Serve the stored plate-crop JPEG for one detection.
+
+    This is a small crop around the read plate - what the ANPR reader actually
+    saw, kept as evidence for the OCR result - not the full camera frame. For
+    that, see the recorded clip: GET /api/v2/streams/{camera_id}/clip, which
+    the console overlays this same detection's bbox onto at the matching
+    instant.
+
+    `snapshot_uri` is never trusted as a filesystem path: only its final path
+    component is used, resolved under `anpr_snapshot_dir`, so a row could not
+    be made to serve an arbitrary file even if it somehow held one.
+    """
+    params: list[Any] = [event_id]
+    predicates = ["d.event_id = $1"]
+    predicates.extend(_scope_predicate(principal, params))
+
+    record = await connection.fetchrow(
+        f"""
+        SELECT d.snapshot_uri
+        FROM detections d
+        LEFT JOIN cameras c ON c.id = d.camera_id
+        WHERE {' AND '.join(predicates)}
+        """,
+        *params,
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"detection '{event_id}' not found in your scope",
+        )
+    if not record["snapshot_uri"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="this detection has no snapshot",
+        )
+
+    filename = Path(record["snapshot_uri"]).name
+    file_path = Path(settings.anpr_snapshot_dir).resolve() / filename
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="snapshot file is missing on disk",
+        )
+
+    return FileResponse(file_path, media_type="image/jpeg")
 
 
 async def broadcast(frame: dict[str, Any]) -> int:

@@ -78,11 +78,17 @@ services:
     # mediamtx.yml for why it must advertise 127.0.0.1 as its ICE host.
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
+      # Recorded segments. Bind-mounted (not a named volume) so files are
+      # directly inspectable from the host, the same posture as
+      # data/anpr_snapshots. Gitignored - this is local evaluation storage,
+      # not something to commit.
+      - ./data/recordings:/recordings
     ports:
       - "127.0.0.1:8554:8554"     # RTSP ingest (publishers push here)
       - "127.0.0.1:8889:8889"     # WebRTC/WHEP signalling
       - "127.0.0.1:8189:8189/udp" # WebRTC media - UDP. Without this, video never arrives.
       - "127.0.0.1:9997:9997"     # control API
+      - "127.0.0.1:9996:9996"     # playback API - GET clips/segment lists for recorded video
     env_file:
       - docker/mediamtx.env
     # No healthcheck: the image is built FROM scratch and contains only the

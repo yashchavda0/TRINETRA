@@ -23,7 +23,7 @@ const DEPARTMENT_DOT = {
 };
 
 export default function LiveTile({ camera, enabled = true, onOpen }) {
-  const { videoRef, status, error, summary, start, paused } = useCameraStream({
+  const { videoRef, status, error, summary, start, paused, exhausted } = useCameraStream({
     cameraId: camera.id,
     enabled,
     autoRetry: true,
@@ -66,6 +66,16 @@ export default function LiveTile({ camera, enabled = true, onOpen }) {
                 <VideoOff className="h-6 w-6 text-state-down" aria-hidden />
                 {/* The API's own sentence, e.g. "camera is INACTIVE, not ACTIVE". */}
                 <p className="text-[11px] leading-snug text-slate-400">{error}</p>
+                {exhausted && (
+                  // Auto-retry gave up after six attempts (~100s). Distinct
+                  // from a single failure: this camera has not been reachable
+                  // for a while, which usually means the upstream feed itself
+                  // is down, not this browser or this tile.
+                  <p className="text-[11px] leading-snug text-state-warn">
+                    not responding after repeated attempts — the upstream feed
+                    may be temporarily unavailable
+                  </p>
+                )}
                 <Button size="sm" variant="ghost" onClick={start} className="mt-1">
                   <RefreshCw className="mr-1 h-3 w-3" aria-hidden />
                   Retry

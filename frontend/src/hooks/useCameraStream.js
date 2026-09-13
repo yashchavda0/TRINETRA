@@ -33,8 +33,20 @@ const STATS_INTERVAL_MS = 2000;
 // Retry backoff. Starts quick enough to ride out a blip, ends slow enough that
 // a camera that is genuinely down is not hammered - nor, more importantly, is
 // the external grid, which serves every reconnect as a fresh RTSP pull.
-const RETRY_BASE_MS = 2000;
+//
+// The base is 5s rather than 2s because a failed attempt already spends up to
+// ~20s waiting inside MediaMTX (NO_VIDEO_TIMEOUT_MS server-side) before our own
+// 504 arrives - a fast client retry on top of that gives the upstream feed no
+// room to recover from whatever rejected it.
+const RETRY_BASE_MS = 5000;
 const RETRY_MAX_MS = 30_000;
+// Observed directly against the external grid: a camera can fail auth
+// ("bad status code: 401") or time out for minutes at a time, not seconds -
+// this is the grid's own reliability, not a blip our code can wait out. Six
+// attempts (5s..30s, ~100s total) is enough to survive a genuine blip without
+// retrying forever into a sustained outage; past that, stop and say so rather
+// than silently keep dialling an account that may itself be rate-limited.
+const MAX_AUTO_RETRIES = 6;
 
 /** True while this document is visible; used to release streams nobody watches. */
 function useDocumentVisible() {
@@ -76,6 +88,10 @@ export function useCameraStream({
   const [error, setError] = useState(null);
   const [stream, setStream] = useState(null);
   const [info, setInfo] = useState(null);
+  // True once MAX_AUTO_RETRIES has been spent with no success: auto-retry has
+  // given up, but the camera stays selectable and a manual Retry (which resets
+  // this) is still offered.
+  const [exhausted, setExhausted] = useState(false);
 
   const visible = useDocumentVisible();
   const active = enabled && (!pauseWhenHidden || visible);
@@ -144,6 +160,7 @@ export function useCameraStream({
         if (event.track.kind === 'video') {
           clearTimers();
           attemptRef.current = 0; // a good connection resets the backoff
+          setExhausted(false);
           setError(null);
           setStatus('live');
         }
@@ -204,6 +221,16 @@ export function useCameraStream({
 
   startRef.current = start;
 
+  // The public entry point. A manual click is a deliberate new attempt, not
+  // the Nth automatic one, so it gets a fresh retry budget - otherwise a tile
+  // that already exhausted its six auto-retries would report itself exhausted
+  // again the instant the operator presses Retry.
+  const manualStart = useCallback(() => {
+    attemptRef.current = 0;
+    setExhausted(false);
+    return start();
+  }, [start]);
+
   // Connect when asked, tear down when not. Keyed on the camera so a tile that
   // is reassigned to another camera swaps cleanly.
   useEffect(() => {
@@ -217,9 +244,18 @@ export function useCameraStream({
   }, [active, cameraId, stop]);
 
   // Recover on its own. This is what makes a wall continuous rather than a grid
-  // of boxes that died at the first blip and stayed dead.
+  // of boxes that died at the first blip and stayed dead - but only up to a
+  // point. Past MAX_AUTO_RETRIES this stops rather than dialling a camera whose
+  // upstream feed has been rejecting connections for minutes: retrying faster
+  // or longer cannot fix an outage on the far side of the grid, and every
+  // attempt is one more RTSP auth request against an account that may itself
+  // be the thing rate-limiting.
   useEffect(() => {
     if (!autoRetry || !active || status !== 'error') return undefined;
+    if (attemptRef.current >= MAX_AUTO_RETRIES) {
+      setExhausted(true);
+      return undefined;
+    }
     const delay = Math.min(RETRY_BASE_MS * 2 ** attemptRef.current, RETRY_MAX_MS);
     attemptRef.current += 1;
     retryRef.current = setTimeout(() => startRef.current?.(), delay);
@@ -329,7 +365,18 @@ export function useCameraStream({
     return { text: `${name} · waiting for frames`, warn: false };
   }, [info]);
 
-  return { videoRef, status, error, stream, info, summary, start, stop, paused: enabled && !active };
+  return {
+    videoRef,
+    status,
+    error,
+    stream,
+    info,
+    summary,
+    start: manualStart,
+    stop,
+    paused: enabled && !active,
+    exhausted,
+  };
 }
 
 export default useCameraStream;

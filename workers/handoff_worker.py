@@ -123,6 +123,12 @@ _INSERT_DETECTION_SQL: Final = """
     RETURNING event_id
 """
 
+_MERGE_VLM_ATTRIBUTES_SQL: Final = """
+    UPDATE detections
+    SET attributes = attributes || $2::jsonb
+    WHERE event_id = $1
+"""
+
 _UPSERT_EMBEDDING_SQL: Final = """
     INSERT INTO target_embeddings (
         target_id, embedding, last_seen_camera_id, last_seen_utc_ms
@@ -619,6 +625,19 @@ class HandoffWorker:
 
         event = decode_event(raw)
 
+        # services/vlm_agent's Tier A (vehicle attribute tagging) republishes a
+        # correlated SurveillanceEvent that enriches an existing detection
+        # rather than reporting a new sighting - the proto's own attributes
+        # doc says so. It must be merged into that row, not inserted as a
+        # second, independent detection: this is checked before the identifier
+        # and embedding gates below, which exist for the normal detection path
+        # and do not apply to an enrichment message.
+        if event.attributes.get("source") == "VLM_AGENT" and event.attributes.get(
+            "source_event_id"
+        ):
+            await self._merge_vlm_attributes(event)
+            return
+
         # An event whose identifiers are unusable cannot be stored: event_id is
         # the primary key and camera_id is NOT NULL, so a malformed one raises
         # inside the INSERT, the offset is committed anyway, and the event
@@ -832,6 +851,58 @@ class HandoffWorker:
                         "wake state not mirrored: camera absent from registry",
                         extra={"camera_id": camera_id},
                     )
+
+    # -- VLM attribute enrichment (services/vlm_agent Tier A) ---------------
+
+    async def _merge_vlm_attributes(self, event: DecodedEvent) -> None:
+        """Fold a Tier A enrichment event's attributes into the detection it tags.
+
+        No Re-ID, no plate handling, no live-feed publish: this message is not
+        a new observation, it is a correction/addition to one already
+        persisted. `source_event_id` is required to be a valid UUID for the
+        same reason event_id and camera_id are validated on the normal path -
+        an UPDATE with no matching row is silent, and a producer bug here must
+        be visible rather than swallowed.
+        """
+        source_event_id = event.attributes.get("source_event_id", "")
+        target = _as_uuid(source_event_id)
+        if target is None:
+            logger.warning(
+                "vlm attribute event has an unusable source_event_id; dropping",
+                extra={"source_event_id": source_event_id},
+            )
+            return
+
+        enrichment = {
+            key: value
+            for key, value in event.attributes.items()
+            if key not in {"source", "source_event_id"}
+        }
+        if not enrichment:
+            return
+
+        pool = database.get_pool()
+        async with pool.acquire() as connection:
+            result = await connection.execute(
+                _MERGE_VLM_ATTRIBUTES_SQL, target, json.dumps(enrichment)
+            )
+
+        # asyncpg's execute() returns a tag like "UPDATE 0" or "UPDATE 1"; a
+        # zero count means the tagging event arrived before (or without) its
+        # source detection ever landing - most likely a producer bug in
+        # services/vlm_agent, since it reads the source event's snapshot_uri
+        # off the same bus this worker already persisted.
+        if result == "UPDATE 0":
+            logger.warning(
+                "vlm attribute tag has no matching detection; dropping",
+                extra={"source_event_id": source_event_id},
+            )
+            return
+
+        logger.info(
+            "vehicle attributes merged",
+            extra={"source_event_id": source_event_id, "attributes": enrichment},
+        )
 
     # -- persistence -------------------------------------------------------
 

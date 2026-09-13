@@ -33,6 +33,7 @@ from app.routers import (
     detections,
     registry_io,
     reports,
+    scene_events,
     streams,
     watchlist,
 )
@@ -134,9 +135,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Keeps relay sessions alive because the console never calls the relay's
     # heartbeat route and the relay reaps after 30s. No-op without a relay.
     streams.start_keepalive(settings)
+    # Brings every ACTIVE camera's MediaMTX path up continuously (not just
+    # while someone is watching) so recording has something to record. No-op
+    # unless MediaMTX is the configured backend.
+    streams.start_recording_reconciler(settings)
     try:
         yield
     finally:
+        await streams.stop_recording_reconciler()
         await streams.stop_keepalive()
         await database.disconnect()
         logger.info("service stopped", extra={"service": settings.app_name})
@@ -291,6 +297,7 @@ app.include_router(reports.router)
 app.include_router(audit.router)
 app.include_router(detections.router)
 app.include_router(detections.ws_router)
+app.include_router(scene_events.router)
 app.include_router(watchlist.router)
 app.include_router(streams.router)
 app.include_router(alerts.router)

@@ -22,6 +22,7 @@ const HealthPage = lazy(() => import('./pages/HealthPage.jsx'));
 const VideoWallPage = lazy(() => import('./pages/VideoWallPage.jsx'));
 const VehicleSearchPage = lazy(() => import('./pages/VehicleSearchPage.jsx'));
 const AlertsPage = lazy(() => import('./pages/AlertsPage.jsx'));
+const SceneEventsPage = lazy(() => import('./pages/SceneEventsPage.jsx'));
 const FederationPage = lazy(() => import('./pages/FederationPage.jsx'));
 const PlaybackPage = lazy(() => import('./pages/PlaybackPage.jsx'));
 const UsersPage = lazy(() => import('./pages/UsersPage.jsx'));
@@ -146,6 +147,14 @@ export default function App() {
           element={
             <Suspense fallback={<FullPageSpinner />}>
               <AlertsPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="scene-events"
+          element={
+            <Suspense fallback={<FullPageSpinner />}>
+              <SceneEventsPage />
             </Suspense>
           }
         />

@@ -1,0 +1,116 @@
+// Gujarat Police CCTV Integration System
+// Analytics bus wire contract for agentic scene/event reasoning output.
+//
+// Kept as its own file, separate from surveillance_event.proto, rather than as
+// new fields on SurveillanceEvent: that message's own doc comment establishes
+// it as one-object-one-instant ("one frame containing three detected objects
+// produces three SurveillanceEvent messages"), and its invariants section
+// reserves tags 10-19 for new *fields*, not new root messages. A scene event
+// is structurally different - temporal (spans a window, not an instant),
+// possibly multi-object (implicated_target_ids is repeated), and carries a
+// free-text rationale - so it gets its own message rather than being forced
+// into that contract's shape.
+//
+// Deliberately does NOT `import "surveillance_event.proto"`. protoc's Python
+// codegen emits a bare `import surveillance_event_pb2` inside the generated
+// scene_event_pb2.py for a proto-level import, which only resolves if the
+// generated/ directory is itself on sys.path - not merely the repo root, which
+// is what every consumer here actually puts on sys.path. Duplicating the two
+// value fields this message needs (position, department) as plain scalars
+// avoids that footgun entirely; department is denormalised the same way
+// threat_alerts already handles it - resolved from `camera_id` via a join to
+// `cameras` at read/persist time, not carried on the wire.
+//
+// GLOBAL INVARIANTS (same as surveillance_event.proto):
+//   * Spatial reference system is WGS84 / EPSG:4326 exclusively.
+//   * All timestamps are UTC Unix epoch MILLISECONDS as int64.
+//   * Wire compatibility: field tags are permanent. Never renumber, never
+//     reuse a retired tag. Add new fields with new tags and move retired tags
+//     to `reserved`.
+
+syntax = "proto3";
+
+package gujpolice.surveillance.v1;
+
+option go_package = "github.com/gujpolice/cctv/gen/surveillance/v1;surveillancev1";
+option java_package = "in.gov.gujarat.police.surveillance.v1";
+option java_multiple_files = true;
+option java_outer_classname = "SceneEventProto";
+option csharp_namespace = "GujPolice.Surveillance.V1";
+
+// Taxonomy of scene-level findings services/vlm_agent's Tier B (agentic
+// reasoning) can raise. UNSPECIFIED (tag 0) signals a producer bug, the same
+// convention SurveillanceEvent's enums use. UNUSUAL_ACTIVITY (tag 5) is a
+// deliberate catch-all for an open-vocabulary VLM finding that fits none of
+// the named categories - it must still carry a rationale explaining what was
+// seen, and a low starting confidence until an operator confirms it.
+enum SceneEventType {
+  SCENE_EVENT_TYPE_UNSPECIFIED = 0;
+  LOITERING = 1;
+  WRONG_WAY = 2;
+  COLLISION = 3;
+  CROWD_DENSITY = 4;
+  UNUSUAL_ACTIVITY = 5;
+}
+
+// One temporal/multi-object scene finding emitted by services/vlm_agent's
+// Tier B reasoning loop for one camera's trigger window.
+//
+// Unlike SurveillanceEvent, this is not published on surveillance-events-raw:
+// it travels on its own topic (scene-events-raw) so its volume and schema
+// never affect the Re-ID/handoff/watchlist consumer already subscribed to the
+// detection stream.
+message SceneEvent {
+  // Canonical hyphenated lowercase UUIDv4 string. Globally unique per finding;
+  // consumers use it as the idempotency key for at-least-once bus delivery.
+  string scene_event_id = 1;
+
+  // UUID of the camera whose trigger window produced this finding. Foreign
+  // key into the Model 1 Central GIS Camera Registry: `cameras.id`. Owning
+  // department is deliberately not carried here - resolve it by joining
+  // `cameras` on this id, the same way threat_alerts already does.
+  string camera_id = 2;
+
+  // Window the reasoning call actually looked at, both UTC Unix epoch
+  // milliseconds. Not a single instant: a scene finding is a judgement over a
+  // buffered clip, not one frame.
+  int64 window_start_utc_ms = 3;
+  int64 window_end_utc_ms = 4;
+
+  // Position of the observing camera, WGS84 decimal degrees, snapshotted at
+  // reasoning time the same way SurveillanceEvent.location is - a later
+  // camera relocation must not retroactively move historical evidence. Plain
+  // scalars rather than a shared GeoLocation message; see the file header for
+  // why this file avoids importing surveillance_event.proto.
+  double latitude = 5;
+  double longitude = 6;
+
+  SceneEventType event_type = 7;
+
+  // VLM-reported confidence, 0.0 to 1.0.
+  float confidence = 8;
+
+  // Natural-language justification the VLM produced for this finding, shown
+  // to an operator reviewing the event - never treated as fact on its own,
+  // always alongside clip_uri.
+  string rationale = 9;
+
+  // Re-ID target_ids (engine/vector_matcher.py identities) implicated in this
+  // finding, when the reasoning could attribute it to specific tracked
+  // vehicles/persons. May be empty, e.g. for a CROWD_DENSITY finding with no
+  // single implicated identity.
+  repeated string implicated_target_ids = 10;
+
+  // Reference to the buffered clip the reasoning call was shown, so an
+  // operator can review the actual evidence rather than only the rationale.
+  string clip_uri = 11;
+
+  // Which VLM build and prompt version produced this finding, e.g.
+  // "moondream2-int8@prompt-v3". Required for audit and for rolling back a
+  // prompt change that starts raising bad findings.
+  string model_version = 12;
+
+  // Tags held back for future contract growth. Reserved so no producer can
+  // claim them ad hoc and collide with a later official field.
+  reserved 13 to 19;
+}

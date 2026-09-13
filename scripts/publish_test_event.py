@@ -65,6 +65,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--track-id", default=None, help="Stable track id; also seeds the embedding")
     parser.add_argument("--plate", default=None, help="license_plate attribute, e.g. GJ01AB1234")
     parser.add_argument("--colour", default="white", help="color attribute (default: white)")
+    parser.add_argument(
+        "--snapshot-uri",
+        default=None,
+        help=(
+            "Path to a real image file. Required to exercise services/vlm_agent's "
+            "Tier A vehicle tagging, which fetches this same path with cv2.imread "
+            "the way workers/handoff_worker.py's snapshot_uri column expects."
+        ),
+    )
     parser.add_argument("--count", type=int, default=1, help="How many events to publish (default: 1)")
     parser.add_argument(
         "--offset-seconds",
@@ -128,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.plate:
             event.attributes["license_plate"] = args.plate.upper()
             event.attributes["license_plate_conf"] = "0.88"
+        if args.snapshot_uri:
+            event.attributes["snapshot_uri"] = args.snapshot_uri
 
         producer.produce(
             args.topic,

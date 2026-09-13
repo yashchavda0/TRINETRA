@@ -13,6 +13,7 @@ import {
   AlertTriangle,
   Camera,
   ClipboardList,
+  Eye,
   Grid2X2,
   LayoutDashboard,
   LogOut,
@@ -52,6 +53,7 @@ const NAV_SECTIONS = [
       { to: '/wall', icon: Grid2X2, label: 'Video Wall', model: 'M2' },
       { to: '/search/vehicles', icon: Search, label: 'Vehicle Search', model: 'M2' },
       { to: '/alerts', icon: AlertTriangle, label: 'Alerts', model: 'M2' },
+      { to: '/scene-events', icon: Eye, label: 'Scene Events', model: 'M2' },
     ],
   },
   {

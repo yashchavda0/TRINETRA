@@ -60,6 +60,13 @@ class PlateReading:
     #: True when format-aware correction changed the OCR's raw output.
     corrected: bool
     raw: str
+    #: True only when `plate` actually matched the Indian registration format.
+    #: False means the detector fired on something - a sign, a motion-blur
+    #: streak, anything rectangular enough to look like a plate - and the OCR
+    #: transcribed whatever text was there. `corrected` says a substitution was
+    #: tried; `format_valid` says the result is actually plate-shaped. A caller
+    #: publishing plate readings as fact must gate on this, not on `corrected`.
+    format_valid: bool
 
 
 def _candidates(text: str) -> list[str]:
@@ -95,24 +102,51 @@ def _candidates(text: str) -> list[str]:
     return [o for o in options if not (o in seen or seen.add(o))]
 
 
-def correct_plate(text: str) -> tuple[str, bool]:
-    """Return (best_reading, was_corrected).
+def correct_plate(text: str) -> tuple[str, bool, bool]:
+    """Return (best_reading, was_corrected, format_valid).
 
     Tries the raw reading against the Indian plate format, then format-aware
     character substitutions. When nothing validates, the cleaned raw text is
-    returned unchanged - a misread is still evidence of what the camera saw, and
-    inventing a valid-looking plate would be far worse than recording an
-    unmatchable one.
+    returned unchanged with `format_valid=False` - a misread is still evidence
+    of what the camera saw, and inventing a valid-looking plate would be far
+    worse than recording an unmatchable one. `format_valid` is what lets a
+    caller tell that case apart from an actual plate-shaped reading: it must
+    not be inferred from `was_corrected`, which is true or false independently
+    of whether the result matches the format at all.
     """
     options = _candidates(text)
     if not options:
-        return "", False
+        return "", False, False
 
     for index, candidate in enumerate(options):
         if _PLATE_RE.match(candidate):
-            return candidate, index > 0
+            return candidate, index > 0, True
 
-    return options[0], False
+    return options[0], False, False
+
+
+def _letterbox(crop: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    """Resize `crop` to exactly (target_width, target_height) without distorting it.
+
+    A plain `cv2.resize` stretches whatever aspect ratio the detector's box
+    happened to have into the model's fixed input - the smaller and more
+    oblong the source crop (a distant or angled plate), the more the character
+    proportions warp, which costs real OCR accuracy on exactly the reads that
+    are already hardest. This scales to fit, then pads with black to the
+    target size, so a character keeps its true shape regardless of the box.
+    """
+    height, width = crop.shape[:2]
+    scale = min(target_width / width, target_height / height)
+    new_width = max(1, round(width * scale))
+    new_height = max(1, round(height * scale))
+
+    scaled = cv2.resize(crop, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+    canvas = np.zeros((target_height, target_width, 3), dtype=crop.dtype)
+    x_offset = (target_width - new_width) // 2
+    y_offset = (target_height - new_height) // 2
+    canvas[y_offset : y_offset + new_height, x_offset : x_offset + new_width] = scaled
+    return canvas
 
 
 class PlateReader:
@@ -204,7 +238,7 @@ class PlateReader:
 
             # The OCR model has a fixed input geometry; anything else raises
             # inside onnxruntime rather than being resized for us.
-            resized = cv2.resize(crop, (128, 64), interpolation=cv2.INTER_CUBIC)
+            resized = _letterbox(crop, 128, 64)
 
             try:
                 predictions = self._ocr.run(resized)
@@ -216,7 +250,7 @@ class PlateReader:
                 continue
 
             raw = str(getattr(predictions[0], "plate", "") or "")
-            plate, corrected = correct_plate(raw)
+            plate, corrected, format_valid = correct_plate(raw)
             if not plate:
                 continue
 
@@ -227,6 +261,7 @@ class PlateReader:
                     box=(x1, y1, x2, y2),
                     corrected=corrected,
                     raw=raw,
+                    format_valid=format_valid,
                 )
             )
 
